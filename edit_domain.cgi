@@ -28,9 +28,8 @@ print &ui_table_row($text{'domain_server'},
 
 # Status for each component
 my @components = (
+	['domain_created',     $text{'domain_domain'}],
 	['dns_configured',     $text{'domain_dns'}],
-	['postfix_configured', $text{'domain_postfix'}],
-	['dovecot_configured', $text{'domain_dovecot'}],
 	['dkim_configured',    $text{'domain_dkim'}],
 	['ssl_synced',         $text{'domain_ssl'}],
 );
@@ -76,6 +75,34 @@ if ($server_id && $server) {
 
 	print &ui_table_end();
 	print &ui_form_end([ [ undef, $text{'domain_save_overrides'} ] ]);
+	}
+
+# Mail users section
+if ($server_id && $state->{'domain_created'}) {
+	my @users = &list_remote_mail_users($d, $server_id);
+	print &ui_columns_start([ $text{'user_email'}, $text{'user_real'},
+	                          $text{'servers_actions'} ]);
+	foreach my $user (@users) {
+		my $uname = $user->{'_name'};
+		my $email = "${uname}\@".$d->{'dom'};
+		my $real = $user->{'real_name'} || '';
+		my $edit_link = "edit_user.cgi?dom=".&urlize($d->{'dom'}).
+		                "&user=".&urlize($uname);
+		print &ui_columns_row([
+			&ui_link($edit_link, &html_escape($email)),
+			&html_escape($real),
+			&ui_link($edit_link, $text{'servers_edit'}),
+			]);
+		}
+	if (!@users) {
+		print &ui_columns_row([ "<i>$text{'domain_no_users'}</i>", "", "" ]);
+		}
+	print &ui_columns_end();
+
+	# Add user link
+	print &ui_link("edit_user.cgi?dom=".&urlize($d->{'dom'}),
+		$text{'domain_add_user'});
+	print "<br>\n";
 	}
 
 # SSL sync button

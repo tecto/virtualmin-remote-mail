@@ -13,6 +13,20 @@ load_plugin_lib("$FindBin::Bin/../virtualmin-remote-mail-lib.pl");
 $main::domains_dir = "$main::module_config_directory/domains";
 load_plugin_feature("$FindBin::Bin/../virtual_feature.pl");
 
+# Helper: extract shell commands from RPC calls (backquote_command args)
+# and strip backslash escaping for easier regex matching
+sub captured_cmds {
+    my @cmds;
+    foreach my $call (@main::_rpc_calls) {
+        if ($call->{'func'} eq 'backquote_command') {
+            push(@cmds, $call->{'args'}[0]);
+            }
+        }
+    my $raw = join("\n", @cmds);
+    $raw =~ s/\\(.)/$1/g;   # remove backslash escapes
+    return $raw;
+}
+
 # =========================================
 # Test: Metadata hooks
 # =========================================
@@ -49,8 +63,8 @@ subtest 'feature_check' => sub {
 
     # Add a server
     save_remote_mail_server('1', {
-        host        => 'vh2.trinsik.io',
-        webmin_host => 'vh2.trinsik.io',
+        host        => 'email1.trinsik.io',
+        webmin_host => 'email1.trinsik.io',
         default     => 1,
     });
     $err = feature_check();
@@ -109,11 +123,11 @@ subtest 'feature_suitable' => sub {
 };
 
 # =========================================
-# Test: feature_validate
+# Test: feature_validate (new state format)
 # =========================================
 
 subtest 'feature_validate' => sub {
-    plan tests => 3;
+    plan tests => 4;
 
     my $d = { 'dom' => 'test.com' };
 
@@ -121,19 +135,24 @@ subtest 'feature_validate' => sub {
     my $err = feature_validate($d);
     ok($err, 'validate fails with no state');
 
-    # Partial state
-    save_domain_state('test.com', { server_id => '1' });
+    # Partial state (missing domain_created)
+    save_domain_state('test.com', { server_id => '1', dns_configured => 1 });
     $err = feature_validate($d);
-    ok($err, 'validate fails with incomplete state');
+    ok($err, 'validate fails without domain_created');
 
     # Complete state
     save_domain_state('test.com', {
         server_id => '1',
         dns_configured => 1,
-        postfix_configured => 1,
+        domain_created => 1,
     });
     $err = feature_validate($d);
     is($err, undef, 'validate passes with complete state');
+
+    # Missing DNS
+    save_domain_state('test.com', { server_id => '1', domain_created => 1 });
+    $err = feature_validate($d);
+    ok($err, 'validate fails without dns_configured');
 
     delete_domain_state('test.com');
 };
@@ -164,7 +183,7 @@ subtest 'Backup and restore' => sub {
     save_domain_state('backup.com', {
         server_id => '1',
         dns_configured => 1,
-        postfix_configured => 1,
+        domain_created => 1,
     });
 
     my $d = { 'dom' => 'backup.com' };
@@ -189,45 +208,51 @@ subtest 'Backup and restore' => sub {
 };
 
 # =========================================
-# Test: feature_setup full lifecycle with mocks
+# Test: feature_setup — uses virtualmin create-domain
 # =========================================
 
 subtest 'feature_setup lifecycle' => sub {
-    plan tests => 5;
+    plan tests => 6;
 
     # Configure a server
     save_remote_mail_server('1', {
-        host         => 'vh2.trinsik.io',
-        webmin_host  => 'vh2.trinsik.io',
-        ssh_host     => 'vh2.trinsik.io',
-        ssh_user     => 'root',
-        ssh_key      => '/root/.ssh/id_rsa',
+        host         => 'email1.trinsik.io',
+        webmin_host  => 'email1.trinsik.io',
+        webmin_port  => 10000,
+        webmin_ssl   => 1,
+        webmin_user  => 'root',
+        webmin_pass  => 'secret',
         spam_gateway => '216.55.103.236',
         spam_gateway_host => 'mg',
         outgoing_relay => 'smtp-out.trinsiklabs.com',
         outgoing_relay_port => 25,
         dkim_selector => '202307',
-        maildir_format => '.maildir',
         default      => 1,
     });
 
     my $d = {
         'dom' => 'lifecycle.com',
         'dns' => 1,
+        'pass' => 'domainpass',
         'remote_mail_server' => '1',
     };
 
-    @main::_commands_run = ();
+    @main::_rpc_calls = ();
     @main::_progress_messages = ();
+    %main::_rpc_initialized = ();
 
     my $ok = feature_setup($d);
     is($ok, 1, 'feature_setup returns success');
 
-    # Check that state was saved
+    # Verify virtualmin create-domain was called
+    my $cmds = captured_cmds();
+    like($cmds, qr/virtualmin create-domain/, 'Uses virtualmin create-domain');
+
+    # Check that state was saved with new format
     my $state = get_domain_state('lifecycle.com');
     ok($state->{'server_id'}, 'State file has server_id');
-    ok($state->{'dns_configured'}, 'State records DNS configured');
-    ok($state->{'postfix_configured'}, 'State records Postfix configured');
+    ok($state->{'domain_created'}, 'State records domain_created');
+    ok($state->{'dns_configured'}, 'State records dns_configured');
 
     # Verify progress messages were emitted
     ok(scalar @main::_progress_messages > 0, 'Progress messages were output');
@@ -239,6 +264,46 @@ subtest 'feature_setup lifecycle' => sub {
 };
 
 # =========================================
+# Test: feature_setup passes correct flags to create-domain
+# =========================================
+
+subtest 'feature_setup command flags' => sub {
+    plan tests => 4;
+
+    save_remote_mail_server('1', {
+        host         => 'email1.trinsik.io',
+        webmin_host  => 'email1.trinsik.io',
+        webmin_port  => 10000,
+        webmin_ssl   => 1,
+        webmin_user  => 'root',
+        webmin_pass  => 'secret',
+        dkim_selector => '202307',
+        default      => 1,
+    });
+
+    my $d = {
+        'dom' => 'flags-test.com',
+        'dns' => 1,
+        'pass' => 'testpass',
+        'remote_mail_server' => '1',
+    };
+
+    @main::_rpc_calls = ();
+    %main::_rpc_initialized = ();
+
+    feature_setup($d);
+
+    my $cmds = captured_cmds();
+    like($cmds, qr/--mail/, 'Mail feature flag');
+    like($cmds, qr/--spam/, 'Spam feature flag');
+    like($cmds, qr/--virus/, 'Virus feature flag');
+    like($cmds, qr/--skip-warnings/, 'Skip warnings flag');
+
+    feature_delete($d);
+    delete_remote_mail_server('1');
+};
+
+# =========================================
 # Test: feature_inputs_parse with overrides
 # =========================================
 
@@ -246,7 +311,7 @@ subtest 'feature_inputs_parse stores overrides in domain hash' => sub {
     plan tests => 5;
 
     save_remote_mail_server('1', {
-        host         => 'vh2.trinsik.io',
+        host         => 'email1.trinsik.io',
         default      => 1,
     });
 
@@ -280,7 +345,7 @@ subtest 'feature_inputs_parse rejects bad input' => sub {
     plan tests => 2;
 
     save_remote_mail_server('1', {
-        host         => 'vh2.trinsik.io',
+        host         => 'email1.trinsik.io',
         default      => 1,
     });
 
@@ -315,7 +380,7 @@ subtest 'feature_args_parse stores overrides' => sub {
     plan tests => 3;
 
     save_remote_mail_server('1', {
-        host         => 'vh2.trinsik.io',
+        host         => 'email1.trinsik.io',
         default      => 1,
     });
 
@@ -342,7 +407,7 @@ subtest 'feature_args_parse rejects bad CLI input' => sub {
     plan tests => 1;
 
     save_remote_mail_server('1', {
-        host         => 'vh2.trinsik.io',
+        host         => 'email1.trinsik.io',
         default      => 1,
     });
 
@@ -359,18 +424,18 @@ subtest 'feature_args_parse rejects bad CLI input' => sub {
 };
 
 # =========================================
-# Test: feature_delete cleans up override keys
+# Test: feature_delete uses virtualmin delete-domain
 # =========================================
 
 subtest 'feature_delete cleanup including override keys' => sub {
-    plan tests => 8;
+    plan tests => 9;
 
     save_remote_mail_server('1', {
-        host         => 'vh2.trinsik.io',
-        ssh_host     => 'vh2.trinsik.io',
-        ssh_user     => 'root',
+        host         => 'email1.trinsik.io',
+        webmin_host  => 'email1.trinsik.io',
+        webmin_user  => 'root',
+        webmin_pass  => 'secret',
         dkim_selector => '202307',
-        maildir_format => '.maildir',
         default      => 1,
     });
 
@@ -378,9 +443,7 @@ subtest 'feature_delete cleanup including override keys' => sub {
     save_domain_state('delete-test.com', {
         server_id => '1',
         dns_configured => 1,
-        postfix_configured => 1,
-        dovecot_configured => 1,
-        dkim_configured => 1,
+        domain_created => 1,
     });
 
     my $d = {
@@ -394,9 +457,13 @@ subtest 'feature_delete cleanup including override keys' => sub {
         'remote_mail_outgoing_relay_port' => '587',
     };
 
-    @main::_commands_run = ();
+    @main::_rpc_calls = ();
     my $ok = feature_delete($d);
     is($ok, 1, 'feature_delete returns success');
+
+    # Verify virtualmin delete-domain was called
+    my $cmds = captured_cmds();
+    like($cmds, qr/virtualmin delete-domain/, 'Uses virtualmin delete-domain');
 
     # Verify state was removed
     my $state = get_domain_state('delete-test.com');
@@ -418,12 +485,13 @@ subtest 'feature_delete cleanup including override keys' => sub {
 # =========================================
 
 subtest 'feature_modify domain rename' => sub {
-    plan tests => 2;
+    plan tests => 3;
 
     save_remote_mail_server('1', {
-        host         => 'vh2.trinsik.io',
-        ssh_host     => 'vh2.trinsik.io',
-        ssh_user     => 'root',
+        host         => 'email1.trinsik.io',
+        webmin_host  => 'email1.trinsik.io',
+        webmin_user  => 'root',
+        webmin_pass  => 'secret',
         dkim_selector => '202307',
         default      => 1,
     });
@@ -431,7 +499,7 @@ subtest 'feature_modify domain rename' => sub {
     save_domain_state('old-name.com', {
         server_id => '1',
         dns_configured => 1,
-        postfix_configured => 1,
+        domain_created => 1,
     });
 
     my $oldd = {
@@ -445,9 +513,13 @@ subtest 'feature_modify domain rename' => sub {
         'remote_mail_server' => '1',
     };
 
-    @main::_commands_run = ();
+    @main::_rpc_calls = ();
     my $ok = feature_modify($newd, $oldd);
     is($ok, 1, 'feature_modify succeeds');
+
+    # Should have called virtualmin modify-domain for the rename
+    my $cmds = captured_cmds();
+    like($cmds, qr/virtualmin modify-domain/, 'Calls virtualmin modify-domain');
 
     # Should have state for new domain, not old
     my $new_state = get_domain_state('new-name.com');
@@ -465,9 +537,10 @@ subtest 'feature_modify with overrides' => sub {
     plan tests => 4;
 
     save_remote_mail_server('1', {
-        host         => 'vh2.trinsik.io',
-        ssh_host     => 'vh2.trinsik.io',
-        ssh_user     => 'root',
+        host         => 'email1.trinsik.io',
+        webmin_host  => 'email1.trinsik.io',
+        webmin_user  => 'root',
+        webmin_pass  => 'secret',
         spam_gateway => '216.55.103.236',
         spam_gateway_host => 'mg',
         dkim_selector => '202307',
@@ -477,7 +550,7 @@ subtest 'feature_modify with overrides' => sub {
     save_domain_state('ovr-old.com', {
         server_id => '1',
         dns_configured => 1,
-        postfix_configured => 1,
+        domain_created => 1,
     });
 
     my $oldd = {
@@ -495,7 +568,7 @@ subtest 'feature_modify with overrides' => sub {
         'remote_mail_spam_gateway_host' => 'spamgw',
     };
 
-    @main::_commands_run = ();
+    @main::_rpc_calls = ();
     my $ok = feature_modify($newd, $oldd);
     is($ok, 1, 'feature_modify with overrides succeeds');
 
@@ -519,9 +592,10 @@ subtest 'feature_modify re-provisions on override change' => sub {
     plan tests => 4;
 
     save_remote_mail_server('1', {
-        host         => 'vh2.trinsik.io',
-        ssh_host     => 'vh2.trinsik.io',
-        ssh_user     => 'root',
+        host         => 'email1.trinsik.io',
+        webmin_host  => 'email1.trinsik.io',
+        webmin_user  => 'root',
+        webmin_pass  => 'secret',
         spam_gateway => '216.55.103.236',
         spam_gateway_host => 'mg',
         outgoing_relay => 'smtp-out.trinsiklabs.com',
@@ -533,7 +607,7 @@ subtest 'feature_modify re-provisions on override change' => sub {
     save_domain_state('same-name.com', {
         server_id => '1',
         dns_configured => 1,
-        postfix_configured => 1,
+        domain_created => 1,
     });
 
     # Old domain: no overrides
@@ -553,7 +627,7 @@ subtest 'feature_modify re-provisions on override change' => sub {
         'remote_mail_outgoing_relay_port' => '2525',
     };
 
-    @main::_commands_run = ();
+    @main::_rpc_calls = ();
     @main::_progress_messages = ();
     my $ok = feature_modify($newd, $oldd);
     is($ok, 1, 'feature_modify triggers on override change');
@@ -564,7 +638,7 @@ subtest 'feature_modify re-provisions on override change' => sub {
     # State should be updated
     my $state = get_domain_state('same-name.com');
     ok($state->{'dns_configured'}, 'DNS still configured after override change');
-    ok($state->{'postfix_configured'}, 'Postfix still configured after override change');
+    ok($state->{'domain_created'}, 'Domain still created after override change');
 
     delete_domain_state('same-name.com');
     delete_remote_mail_server('1');
@@ -574,9 +648,10 @@ subtest 'feature_modify skips when no changes' => sub {
     plan tests => 2;
 
     save_remote_mail_server('1', {
-        host         => 'vh2.trinsik.io',
-        ssh_host     => 'vh2.trinsik.io',
-        ssh_user     => 'root',
+        host         => 'email1.trinsik.io',
+        webmin_host  => 'email1.trinsik.io',
+        webmin_user  => 'root',
+        webmin_pass  => 'secret',
         default      => 1,
     });
 
@@ -598,34 +673,95 @@ subtest 'feature_modify skips when no changes' => sub {
 };
 
 # =========================================
+# Test: feature_disable uses virtualmin disable-domain
+# =========================================
+
+subtest 'feature_disable' => sub {
+    plan tests => 2;
+
+    save_remote_mail_server('1', {
+        host         => 'email1.trinsik.io',
+        webmin_host  => 'email1.trinsik.io',
+        webmin_user  => 'root',
+        webmin_pass  => 'secret',
+        default      => 1,
+    });
+
+    my $d = { 'dom' => 'disable-test.com', 'dns' => 1,
+              'remote_mail_server' => '1' };
+
+    @main::_rpc_calls = ();
+    my $ok = feature_disable($d);
+    is($ok, 1, 'feature_disable succeeds');
+
+    my $cmds = captured_cmds();
+    like($cmds, qr/virtualmin disable-domain/, 'Uses virtualmin disable-domain');
+
+    delete_remote_mail_server('1');
+};
+
+# =========================================
+# Test: feature_enable uses virtualmin enable-domain
+# =========================================
+
+subtest 'feature_enable' => sub {
+    plan tests => 2;
+
+    save_remote_mail_server('1', {
+        host         => 'email1.trinsik.io',
+        webmin_host  => 'email1.trinsik.io',
+        webmin_user  => 'root',
+        webmin_pass  => 'secret',
+        default      => 1,
+    });
+
+    my $d = { 'dom' => 'enable-test.com', 'dns' => 1,
+              'remote_mail_server' => '1' };
+
+    @main::_rpc_calls = ();
+    my $ok = feature_enable($d);
+    is($ok, 1, 'feature_enable succeeds');
+
+    my $cmds = captured_cmds();
+    like($cmds, qr/virtualmin enable-domain/, 'Uses virtualmin enable-domain');
+
+    delete_remote_mail_server('1');
+};
+
+# =========================================
 # Test: rollback_setup cleans up partial state
 # =========================================
 
 subtest 'rollback_setup' => sub {
-    plan tests => 1;
+    plan tests => 2;
 
     save_remote_mail_server('1', {
-        host    => 'vh2.trinsik.io',
-        ssh_host => 'vh2.trinsik.io',
-        ssh_user => 'root',
+        host         => 'email1.trinsik.io',
+        webmin_host  => 'email1.trinsik.io',
+        webmin_user  => 'root',
+        webmin_pass  => 'secret',
         dkim_selector => '202307',
-        default => 1,
+        default      => 1,
     });
 
     save_domain_state('rollback.com', {
         server_id => '1',
+        domain_created => 1,
         dns_configured => 1,
-        postfix_configured => 1,
     });
 
     my $d = { 'dom' => 'rollback.com', 'dns' => 1 };
     my %state = (
+        domain_created => 1,
         dns_configured => 1,
-        postfix_configured => 1,
     );
 
-    @main::_commands_run = ();
+    @main::_rpc_calls = ();
     rollback_setup($d, '1', \%state);
+
+    # Rollback should call virtualmin delete-domain
+    my $cmds = captured_cmds();
+    like($cmds, qr/virtualmin delete-domain/, 'Rollback deletes domain on email1');
 
     my $cleaned = get_domain_state('rollback.com');
     ok(!$cleaned->{'server_id'}, 'State removed after rollback');

@@ -358,6 +358,119 @@ subtest 'validate_mail_override — invalid inputs' => sub {
 };
 
 # =========================================
+# Test: remote_mail_cmd via RPC
+# =========================================
+
+subtest 'remote_mail_cmd via RPC' => sub {
+    plan tests => 5;
+
+    # Set up a server with webmin credentials
+    save_remote_mail_server('rpc1', {
+        host        => 'vh2.trinsik.io',
+        webmin_host => 'vh2.trinsik.io',
+        webmin_port => 10000,
+        webmin_ssl  => 1,
+        webmin_user => 'root',
+        webmin_pass => 'secret',
+        default     => 1,
+    });
+
+    @main::_rpc_calls = ();
+    my ($out, $exit) = remote_mail_cmd('rpc1', 'echo hello');
+    is($exit, 0, 'Exit code parsed from sentinel');
+    like($out, qr/ok/, 'Output returned from RPC');
+
+    # Verify the RPC call was made with backquote_command
+    ok(scalar @main::_rpc_calls > 0, 'RPC call was captured');
+    is($main::_rpc_calls[-1]{'func'}, 'backquote_command',
+       'RPC uses backquote_command');
+    like($main::_rpc_calls[-1]{'args'}[0], qr/__RC__/,
+       'Command wrapped with sentinel');
+
+    delete_remote_mail_server('rpc1');
+};
+
+# =========================================
+# Test: _build_rpc_server helper
+# =========================================
+
+subtest '_build_rpc_server helper' => sub {
+    plan tests => 5;
+
+    my %server = (
+        host        => 'vh2.trinsik.io',
+        webmin_host => 'webmin.trinsik.io',
+        webmin_port => 10000,
+        webmin_ssl  => 1,
+        webmin_user => 'admin',
+        webmin_pass => 'secret123',
+    );
+
+    my $serv = _build_rpc_server(\%server);
+    is($serv->{'host'}, 'webmin.trinsik.io', 'Uses webmin_host');
+    is($serv->{'port'}, 10000, 'Uses webmin_port');
+    is($serv->{'ssl'}, 1, 'Uses webmin_ssl');
+    is($serv->{'user'}, 'admin', 'Uses webmin_user');
+    is($serv->{'pass'}, 'secret123', 'Uses webmin_pass');
+};
+
+# =========================================
+# Test: remote_mail_write via RPC
+# =========================================
+
+subtest 'remote_mail_write via RPC' => sub {
+    plan tests => 3;
+
+    save_remote_mail_server('rpc2', {
+        host        => 'vh2.trinsik.io',
+        webmin_host => 'vh2.trinsik.io',
+        webmin_port => 10000,
+        webmin_ssl  => 1,
+        webmin_user => 'root',
+        webmin_pass => 'secret',
+        default     => 1,
+    });
+
+    @main::_files_written = ();
+    my $ok = remote_mail_write('rpc2', '/tmp/local.pem', '/etc/ssl/remote.pem');
+    ok($ok, 'remote_mail_write returns success');
+    is(scalar @main::_files_written, 1, 'One file write captured');
+    is($main::_files_written[0]{'remote'}, '/etc/ssl/remote.pem',
+       'Remote path captured correctly');
+
+    delete_remote_mail_server('rpc2');
+};
+
+# =========================================
+# Test: test_remote_mail_server — RPC only
+# =========================================
+
+subtest 'test_remote_mail_server — RPC only' => sub {
+    plan tests => 2;
+
+    save_remote_mail_server('rpc3', {
+        host        => 'vh2.trinsik.io',
+        webmin_host => 'vh2.trinsik.io',
+        webmin_port => 10000,
+        webmin_ssl  => 1,
+        webmin_user => 'root',
+        webmin_pass => 'secret',
+        default     => 1,
+    });
+
+    @main::_commands_run = ();
+    @main::_rpc_calls = ();
+    my $err = test_remote_mail_server('rpc3');
+    is($err, undef, 'RPC-only connectivity test passes');
+
+    # Verify NO SSH commands were run (backquote_command is SSH)
+    is(scalar @main::_commands_run, 0,
+       'No SSH commands run during connectivity test');
+
+    delete_remote_mail_server('rpc3');
+};
+
+# =========================================
 # Test: ACL
 # =========================================
 
@@ -366,6 +479,242 @@ subtest 'ACL checks' => sub {
 
     # With wildcard access
     ok(can_edit_domain('anything.com'), 'Wildcard ACL allows all');
+};
+
+# =========================================
+# Test: _ensure_rpc_session establishes session before RPC calls
+# Regression: Without remote_foreign_require(), rpc.cgi receives
+# session=undef, tries to open non-existent FIFOs, returns 0 bytes.
+# =========================================
+
+subtest '_ensure_rpc_session — establishes session before first RPC call' => sub {
+    plan tests => 4;
+
+    save_remote_mail_server('sess1', {
+        host        => 'vh2.trinsik.io',
+        webmin_host => 'vh2.trinsik.io',
+        webmin_port => 10000,
+        webmin_ssl  => 1,
+        webmin_user => 'root',
+        webmin_pass => 'secret',
+        default     => 1,
+    });
+
+    # Reset session tracking state
+    %main::_rpc_initialized = ();
+    @main::_rpc_require_calls = ();
+    @main::_rpc_calls = ();
+
+    remote_mail_cmd('sess1', 'echo test');
+
+    # remote_foreign_require MUST have been called to establish session
+    is(scalar @main::_rpc_require_calls, 1,
+       'remote_foreign_require called exactly once');
+    is($main::_rpc_require_calls[0]{'module'}, 'webmin',
+       'Session established for webmin module');
+
+    # The actual backquote_command RPC call should also have been made
+    ok(scalar @main::_rpc_calls > 0,
+       'remote_foreign_call also made');
+    is($main::_rpc_calls[-1]{'func'}, 'backquote_command',
+       'RPC call used backquote_command');
+
+    delete_remote_mail_server('sess1');
+};
+
+# =========================================
+# Test: _ensure_rpc_session is idempotent (one require per server)
+# =========================================
+
+subtest '_ensure_rpc_session — idempotent per server' => sub {
+    plan tests => 1;
+
+    save_remote_mail_server('sess2', {
+        host        => 'vh2.trinsik.io',
+        webmin_host => 'vh2.trinsik.io',
+        webmin_port => 10000,
+        webmin_ssl  => 1,
+        webmin_user => 'root',
+        webmin_pass => 'secret',
+        default     => 1,
+    });
+
+    %main::_rpc_initialized = ();
+    @main::_rpc_require_calls = ();
+
+    # Call remote_mail_cmd three times on the same server
+    remote_mail_cmd('sess2', 'echo one');
+    remote_mail_cmd('sess2', 'echo two');
+    remote_mail_cmd('sess2', 'echo three');
+
+    # remote_foreign_require should still only have been called once
+    is(scalar @main::_rpc_require_calls, 1,
+       'remote_foreign_require called only once despite 3 RPC calls');
+
+    delete_remote_mail_server('sess2');
+};
+
+# =========================================
+# Test: _ensure_rpc_session — separate sessions for different servers
+# =========================================
+
+subtest '_ensure_rpc_session — separate sessions per server' => sub {
+    plan tests => 3;
+
+    save_remote_mail_server('sessA', {
+        host        => 'server-a.example.com',
+        webmin_host => 'server-a.example.com',
+        webmin_port => 10000,
+        webmin_ssl  => 1,
+        webmin_user => 'root',
+        webmin_pass => 'secret',
+        default     => 0,
+    });
+    save_remote_mail_server('sessB', {
+        host        => 'server-b.example.com',
+        webmin_host => 'server-b.example.com',
+        webmin_port => 10000,
+        webmin_ssl  => 1,
+        webmin_user => 'root',
+        webmin_pass => 'secret',
+        default     => 0,
+    });
+
+    %main::_rpc_initialized = ();
+    @main::_rpc_require_calls = ();
+
+    remote_mail_cmd('sessA', 'echo a');
+    remote_mail_cmd('sessB', 'echo b');
+
+    is(scalar @main::_rpc_require_calls, 2,
+       'remote_foreign_require called once per unique server');
+
+    # Verify they were for different hosts
+    my @hosts = map { $_->{'server'}{'host'} } @main::_rpc_require_calls;
+    ok(grep(/server-a/, @hosts), 'Session established for server A');
+    ok(grep(/server-b/, @hosts), 'Session established for server B');
+
+    delete_remote_mail_server('sessA');
+    delete_remote_mail_server('sessB');
+};
+
+# =========================================
+# Test: remote_mail_call establishes session before call
+# =========================================
+
+subtest 'remote_mail_call — establishes session' => sub {
+    plan tests => 2;
+
+    save_remote_mail_server('sess3', {
+        host        => 'vh2.trinsik.io',
+        webmin_host => 'vh2.trinsik.io',
+        webmin_port => 10000,
+        webmin_ssl  => 1,
+        webmin_user => 'root',
+        webmin_pass => 'secret',
+        default     => 1,
+    });
+
+    %main::_rpc_initialized = ();
+    @main::_rpc_require_calls = ();
+
+    remote_mail_call('sess3', 'webmin', 'get_webmin_version');
+
+    is(scalar @main::_rpc_require_calls, 1,
+       'remote_mail_call establishes session via remote_foreign_require');
+    is($main::_rpc_require_calls[0]{'module'}, 'webmin',
+       'Session established for webmin module');
+
+    delete_remote_mail_server('sess3');
+};
+
+# =========================================
+# Test: remote_mail_write establishes session before write
+# =========================================
+
+subtest 'remote_mail_write — establishes session' => sub {
+    plan tests => 1;
+
+    save_remote_mail_server('sess4', {
+        host        => 'vh2.trinsik.io',
+        webmin_host => 'vh2.trinsik.io',
+        webmin_port => 10000,
+        webmin_ssl  => 1,
+        webmin_user => 'root',
+        webmin_pass => 'secret',
+        default     => 1,
+    });
+
+    %main::_rpc_initialized = ();
+    @main::_rpc_require_calls = ();
+    @main::_files_written = ();
+
+    remote_mail_write('sess4', '/tmp/local.pem', '/etc/ssl/remote.pem');
+
+    is(scalar @main::_rpc_require_calls, 1,
+       'remote_mail_write establishes session via remote_foreign_require');
+
+    delete_remote_mail_server('sess4');
+};
+
+# =========================================
+# Test: remote_mail_cmd handles multi-line output from RPC
+# Regression: backquote_command returns a LIST of lines through the RPC
+# FIFO layer.  Without join(), scalar context gives the line count (e.g. 3)
+# instead of the actual output content.
+# =========================================
+
+subtest 'remote_mail_cmd — multi-line output joined correctly' => sub {
+    plan tests => 3;
+
+    save_remote_mail_server('ml1', {
+        host        => 'vh2.trinsik.io',
+        webmin_host => 'vh2.trinsik.io',
+        webmin_port => 10000,
+        webmin_ssl  => 1,
+        webmin_user => 'root',
+        webmin_pass => 'secret',
+        default     => 1,
+    });
+
+    %main::_rpc_initialized = ();
+    @main::_rpc_calls = ();
+
+    my ($out, $exit) = remote_mail_cmd('ml1', 'echo hello');
+
+    # The mock returns ("ok\n", "\n", "__RC__=0\n") — 3 list elements.
+    # If code used scalar context: $out would be "3" (the count) — WRONG
+    # With join(): $out should contain the actual content — CORRECT
+    isnt($out, '3', 'Output is NOT the line count (regression check)');
+    like($out, qr/ok/, 'Output contains actual command output');
+    is($exit, 0, 'Exit code correctly parsed from multi-line output');
+
+    delete_remote_mail_server('ml1');
+};
+
+# =========================================
+# Test: ACL — undefined or empty access allows all (root user fix)
+# Regression: can_edit_domain() failed for root users because
+# $access{'dom'} was undefined, not '*'.
+# =========================================
+
+subtest 'ACL — undefined access allows all (root user)' => sub {
+    plan tests => 3;
+
+    # Save original and test with undefined
+    my $orig = $main::access{'dom'};
+
+    delete $main::access{'dom'};
+    ok(can_edit_domain('anything.com'), 'Undefined ACL allows all (root user)');
+
+    $main::access{'dom'} = '';
+    ok(can_edit_domain('anything.com'), 'Empty string ACL allows all');
+
+    $main::access{'dom'} = 'specific.com other.com';
+    ok(!can_edit_domain('blocked.com'), 'Specific ACL blocks unlisted domain');
+
+    # Restore
+    $main::access{'dom'} = $orig;
 };
 
 done_testing();

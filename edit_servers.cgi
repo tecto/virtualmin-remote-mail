@@ -76,19 +76,20 @@ print &ui_table_row($text{'server_webmin_pass'},
 	&ui_password("webmin_pass", '', 20) .
 	($server->{'webmin_pass'} ? " <i>(set)</i>" : ""));
 
-print &ui_table_row("<b>SSH Settings</b>", "");
+print &ui_table_row("<b>$text{'server_ssh_header'}</b>", "");
+print &ui_table_row("", "<i>$text{'server_ssh_note'}</i>");
 
-# SSH host
+# SSH host (deprecated — kept for reference)
 print &ui_table_row($text{'server_ssh_host'},
-	&ui_textbox("ssh_host", $server->{'ssh_host'} || $server->{'host'}, 40));
+	&ui_textbox("ssh_host", $server->{'ssh_host'} || '', 40));
 
-# SSH user
+# SSH user (deprecated)
 print &ui_table_row($text{'server_ssh_user'},
-	&ui_textbox("ssh_user", $server->{'ssh_user'} || 'root', 20));
+	&ui_textbox("ssh_user", $server->{'ssh_user'} || '', 20));
 
-# SSH key
+# SSH key (deprecated)
 print &ui_table_row($text{'server_ssh_key'},
-	&ui_textbox("ssh_key", $server->{'ssh_key'} || '/root/.ssh/id_rsa', 50));
+	&ui_textbox("ssh_key", $server->{'ssh_key'} || '', 50));
 
 print &ui_table_row("<b>Mail Routing</b>", "");
 

@@ -270,10 +270,19 @@ sub error_setup {
     # Store error prefix
 }
 
-# Logging
+# Logging (captured for test assertions)
+our @_webmin_log;
 sub webmin_log {
     my ($action, $type, $object, $params) = @_;
-    # No-op for testing; could be captured
+    push(@_webmin_log, { action => $action, type => $type,
+                         object => $object, params => $params });
+}
+
+# Redirect (captured for test assertions)
+our @_redirects;
+sub redirect {
+    my ($url) = @_;
+    push(@_redirects, $url);
 }
 
 # Text substitution (Webmin's &text() function)
@@ -305,15 +314,63 @@ sub urlize {
 
 # Remote calls (mock — captured for test assertions)
 our @_rpc_calls;
+
+# Configurable command responses: pattern => response mapping.
+# When backquote_command receives a command matching a pattern key, return
+# the configured response instead of the default "ok".
+# Values can be:
+#   - A simple string (returned with exit code 0)
+#   - A hashref { output => "...", exit => N }
+our %_mock_cmd_responses;
+
 sub remote_foreign_call {
     my ($server, $module, $func, @args) = @_;
     push(@_rpc_calls, { server => $server, module => $module,
                         func => $func, args => \@args });
+    # When used as backquote_command (RPC shell exec), return sentinel output.
+    # IMPORTANT: Return a LIST of lines, not a scalar string.
+    # This matches real Webmin RPC behavior: backquote_command uses Perl
+    # backticks which return a list in list context, and the RPC FIFO
+    # subprocess captures in list context.  Callers MUST use
+    #   join("", &remote_foreign_call(...))
+    # or capture in list context.  Returning a scalar here would hide the
+    # list-context bug that caused production failures (scalar(@list) gives
+    # the line count, not the content).
+    if ($func eq 'backquote_command') {
+        my $cmd = $args[0];
+        # Check configurable responses first
+        foreach my $pattern (keys %_mock_cmd_responses) {
+            if ($cmd =~ /$pattern/) {
+                my $resp = $_mock_cmd_responses{$pattern};
+                if (ref($resp) eq 'HASH') {
+                    my $out = defined $resp->{'output'} ? $resp->{'output'} : '';
+                    my $rc = defined $resp->{'exit'} ? $resp->{'exit'} : 0;
+                    $out .= "\n" if ($out ne '' && $out !~ /\n$/);
+                    return ($out, "__RC__=${rc}\n");
+                    }
+                return ("${resp}\n", "\n__RC__=0\n");
+                }
+            }
+        return ("ok\n", "\n", "__RC__=0\n");
+        }
     return 1;
 }
 
+# Remote file writes (mock — captured for test assertions)
+our @_files_written;
+sub remote_write {
+    my ($server, $local_file, $remote_file) = @_;
+    push(@_files_written, { server => $server, local => $local_file,
+                            remote => $remote_file });
+    return 1;
+}
+
+# Remote require (mock — captured for test assertions)
+our @_rpc_require_calls;
 sub remote_foreign_require {
     my ($server, $module, $file) = @_;
+    push(@_rpc_require_calls, { server => $server, module => $module,
+                                file => $file });
     return 1;
 }
 
@@ -405,6 +462,10 @@ sub create_dns_record {
 
 sub delete_dns_record {
     return 1;
+}
+
+sub save_domain {
+    # No-op for testing
 }
 
 package main;

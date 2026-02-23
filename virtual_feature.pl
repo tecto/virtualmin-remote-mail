@@ -1,6 +1,17 @@
 # virtual_feature.pl
 # Virtualmin feature hooks for the Remote Mail Server plugin.
 # This file is loaded by Virtualmin to register the plugin as a domain feature.
+#
+# Architecture (Approach C):
+#   vh1 (this plugin) — Coordination layer:
+#     DNS records (MX, SPF, DKIM, DMARC) on vh1's DNS
+#     SSL certificate sync to email1
+#     UI for managing remote mail users
+#     Delegates all mail server operations to email1's Virtualmin
+#
+#   email1 (remote Virtualmin) — All mail server operations:
+#     Virtualmin CLI API: create-domain, create-user, modify-user, etc.
+#     Handles Postfix, Dovecot, SpamAssassin, ClamAV, DKIM, quotas
 
 use strict;
 use warnings;
@@ -88,7 +99,8 @@ return !$aliasdom && !$subdom;
 
 # feature_setup(&domain)
 # Called when this feature is enabled for a domain.
-# Provisions DNS records on vh1 and mail services on the remote server.
+# Creates the domain on the remote mail server via Virtualmin API,
+# then configures DNS records on vh1.
 sub feature_setup
 {
 my ($d) = @_;
@@ -116,75 +128,86 @@ if ($err) {
 	}
 &$virtual_server::second_print($virtual_server::text{'setup_done'});
 
-# Step 2: DNS records (MX, SPF, A records for mail hosts)
-&$virtual_server::first_print($text{'setup_dns'});
-$err = &setup_remote_mail_dns($d, $server);
-if ($err) {
-	&$virtual_server::second_print(&text('setup_edns', $err));
-	$ok = 0;
-	}
-else {
-	$state{'dns_configured'} = 1;
-	&$virtual_server::second_print($virtual_server::text{'setup_done'});
-	}
-
-# Step 3: Postfix configuration on remote server
+# Step 2: Create domain on remote mail server via Virtualmin API
+# This handles: Unix user, home dir, Postfix, Dovecot, SpamAssassin,
+# ClamAV, DKIM, and all other mail-related configuration.
 if ($ok) {
-	&$virtual_server::first_print($text{'setup_postfix'});
-	$err = &setup_remote_postfix($d, $server_id, $server);
-	if ($err) {
+	&$virtual_server::first_print($text{'setup_domain'});
+	my @create_args = (
+		"--domain", $d->{'dom'},
+		"--pass", $d->{'pass'} || 'changeme',
+		"--mail", "--spam", "--virus", "--unix", "--dir",
+		"--skip-warnings",
+		);
+	push(@create_args, "--template", $server->{'template'})
+		if ($server->{'template'});
+
+	my ($out, $exit) = &remote_virtualmin_cmd($server_id,
+		"create-domain", @create_args);
+	if ($exit) {
 		&$virtual_server::second_print(
-			&text('setup_epostfix', $err));
+			&text('setup_edomain_create', $out));
 		$ok = 0;
 		}
 	else {
-		$state{'postfix_configured'} = 1;
+		$state{'domain_created'} = 1;
 		&$virtual_server::second_print(
 			$virtual_server::text{'setup_done'});
 		}
 	}
 
-# Step 4: Dovecot user on remote server
-if ($ok) {
-	&$virtual_server::first_print($text{'setup_dovecot'});
-	$err = &setup_remote_dovecot($d, $server_id, $server);
-	if ($err) {
-		&$virtual_server::second_print(
-			&text('setup_edovecot', $err));
-		$ok = 0;
-		}
-	else {
-		$state{'dovecot_configured'} = 1;
-		&$virtual_server::second_print(
-			$virtual_server::text{'setup_done'});
-		}
-	}
-
-# Step 5: DKIM on remote server
+# Step 3: Generate DKIM key on remote server (non-fatal)
 if ($ok) {
 	&$virtual_server::first_print($text{'setup_dkim'});
-	$err = &setup_remote_dkim($d, $server_id, $server);
-	if ($err) {
-		&$virtual_server::second_print(
-			&text('setup_edkim', $err));
-		# DKIM failure is non-fatal
-		}
-	else {
+	my ($out, $exit) = &remote_virtualmin_cmd($server_id,
+		"modify-mail",
+		"--domain", $d->{'dom'}, "--generate-dkim-key");
+	if (!$exit) {
 		$state{'dkim_configured'} = 1;
 		$d->{'remote_mail_dkim_enabled'} = 1;
 		&$virtual_server::second_print(
 			$virtual_server::text{'setup_done'});
 		}
+	else {
+		&$virtual_server::second_print(
+			&text('setup_edkim', $out));
+		# DKIM failure is non-fatal
+		}
 	}
 
-# Step 6: SSL certificate sync
+# Step 4: DNS records on vh1 (MX, SPF, DMARC, autoconfig)
+if ($ok) {
+	&$virtual_server::first_print($text{'setup_dns'});
+	$err = &setup_remote_mail_dns($d, $server);
+	if ($err) {
+		&$virtual_server::second_print(&text('setup_edns', $err));
+		$ok = 0;
+		}
+	else {
+		$state{'dns_configured'} = 1;
+		&$virtual_server::second_print(
+			$virtual_server::text{'setup_done'});
+		}
+	}
+
+# Step 5: DKIM DNS record on vh1 (needs key from email1)
+if ($ok && $state{'dkim_configured'}) {
+	my $selector = $server->{'dkim_selector'} || '202307';
+	my $pubkey = &get_remote_dkim_public_key(
+		$server_id, $d->{'dom'}, $selector);
+	if ($pubkey) {
+		$err = &setup_dkim_dns_record($d, $selector, $pubkey);
+		# DKIM DNS failure is non-fatal
+		}
+	}
+
+# Step 6: SSL certificate sync (non-fatal)
 if ($ok) {
 	&$virtual_server::first_print($text{'setup_ssl'});
 	$err = &sync_remote_mail_ssl($d, $server_id);
 	if ($err) {
 		&$virtual_server::second_print(
 			&text('setup_essl', $err));
-		# SSL failure is non-fatal
 		}
 	else {
 		$state{'ssl_synced'} = 1;
@@ -210,7 +233,7 @@ return $ok;
 
 # feature_delete(&domain)
 # Called when this feature is disabled or the domain is being deleted.
-# Tears down all remote mail configuration.
+# Deletes the domain on the remote mail server and cleans up DNS on vh1.
 sub feature_delete
 {
 my ($d) = @_;
@@ -219,13 +242,15 @@ my $server = &get_remote_mail_server($server_id);
 
 &obtain_lock_remote_mail($d);
 
-# Remove DKIM on remote
-if ($d->{'remote_mail_dkim_enabled'} && $server) {
-	&$virtual_server::first_print($text{'delete_dkim'});
-	my $err = &delete_remote_dkim($d, $server_id, $server);
-	if ($err) {
+# Remove domain on remote mail server via Virtualmin API
+# This handles: all users, Postfix, Dovecot, DKIM, SpamAssassin, etc.
+if ($server_id) {
+	&$virtual_server::first_print($text{'delete_domain'});
+	my ($out, $exit) = &remote_virtualmin_cmd($server_id,
+		"delete-domain", "--domain", $d->{'dom'});
+	if ($exit) {
 		&$virtual_server::second_print(
-			&text('delete_edkim', $err));
+			&text('delete_edomain', $out));
 		}
 	else {
 		&$virtual_server::second_print(
@@ -233,35 +258,7 @@ if ($d->{'remote_mail_dkim_enabled'} && $server) {
 		}
 	}
 
-# Remove Dovecot user on remote
-if ($server) {
-	&$virtual_server::first_print($text{'delete_dovecot'});
-	my $err = &delete_remote_dovecot($d, $server_id, $server);
-	if ($err) {
-		&$virtual_server::second_print(
-			&text('delete_edovecot', $err));
-		}
-	else {
-		&$virtual_server::second_print(
-			$virtual_server::text{'setup_done'});
-		}
-	}
-
-# Remove Postfix config on remote
-if ($server) {
-	&$virtual_server::first_print($text{'delete_postfix'});
-	my $err = &delete_remote_postfix($d, $server_id, $server);
-	if ($err) {
-		&$virtual_server::second_print(
-			&text('delete_epostfix', $err));
-		}
-	else {
-		&$virtual_server::second_print(
-			$virtual_server::text{'setup_done'});
-		}
-	}
-
-# Remove DNS records
+# Remove DNS records on vh1
 &$virtual_server::first_print($text{'delete_dns'});
 my $err = &delete_remote_mail_dns($d, $server);
 if ($err) {
@@ -314,37 +311,30 @@ if ($renamed || $overrides_changed) {
 
 	&obtain_lock_remote_mail($d);
 
-	# Update DNS records — delete with old config, create with new
-	my $err = &delete_remote_mail_dns($oldd, $server);
+	my $err;
+
+	# On rename, tell email1's Virtualmin to rename the domain
+	if ($renamed && $server_id) {
+		($err) = _modify_err(&remote_virtualmin_cmd($server_id,
+			"modify-domain",
+			"--domain", $oldd->{'dom'},
+			"--newdomain", $d->{'dom'}));
+		}
+
+	# Update DNS records on vh1 — delete with old config, create with new
+	if (!$err) {
+		$err = &delete_remote_mail_dns($oldd, $server);
+		}
 	if (!$err) {
 		$err = &setup_remote_mail_dns($d, $server);
-		}
-
-	# Update Postfix transports
-	if (!$err && $server) {
-		if ($renamed) {
-			$err = &modify_remote_postfix($d, $oldd, $server_id, $server);
-			}
-		elsif ($overrides_changed) {
-			# Delete with old domain hash, recreate with new
-			$err = &delete_remote_postfix($oldd, $server_id, $server);
-			$err = &setup_remote_postfix($d, $server_id, $server) if (!$err);
-			}
-		}
-
-	# Update DKIM (only on rename — overrides don't affect DKIM)
-	if (!$err && $renamed && $server && $d->{'remote_mail_dkim_enabled'}) {
-		&delete_remote_dkim($oldd, $server_id, $server);
-		$err = &setup_remote_dkim($d, $server_id, $server);
 		}
 
 	# Move/update state file
 	&delete_domain_state($oldd->{'dom'}) if ($renamed);
 	my %state = ( 'server_id' => $server_id,
 	              'setup_time' => time(),
+	              'domain_created' => 1,
 	              'dns_configured' => 1,
-	              'postfix_configured' => 1,
-	              'dovecot_configured' => 1,
 	              'dkim_configured' => $d->{'remote_mail_dkim_enabled'} || 0 );
 	&save_domain_state($d->{'dom'}, \%state);
 
@@ -359,18 +349,27 @@ if ($renamed || $overrides_changed) {
 return 1;
 }
 
+# _modify_err($output, $exit)
+# Helper to convert remote_virtualmin_cmd return to error string or undef.
+sub _modify_err
+{
+my ($out, $exit) = @_;
+return $exit ? $out : undef;
+}
+
 # feature_disable(&domain)
-# Called when the domain is being disabled (suspended)
+# Called when the domain is being disabled (suspended).
+# Tells email1's Virtualmin to disable the domain.
 sub feature_disable
 {
 my ($d) = @_;
 &$virtual_server::first_print($text{'disable_mail'});
 my $server_id = &get_domain_mail_server($d);
 
-# Disable Postfix transport on remote (stops accepting mail)
-my $err = &disable_remote_postfix($d, $server_id);
-if ($err) {
-	&$virtual_server::second_print(&text('disable_err', $err));
+my ($out, $exit) = &remote_virtualmin_cmd($server_id,
+	"disable-domain", "--domain", $d->{'dom'});
+if ($exit) {
+	&$virtual_server::second_print(&text('disable_err', $out));
 	return 0;
 	}
 &$virtual_server::second_print($virtual_server::text{'setup_done'});
@@ -378,17 +377,18 @@ return 1;
 }
 
 # feature_enable(&domain)
-# Called when the domain is being re-enabled (unsuspended)
+# Called when the domain is being re-enabled (unsuspended).
+# Tells email1's Virtualmin to enable the domain.
 sub feature_enable
 {
 my ($d) = @_;
 &$virtual_server::first_print($text{'enable_mail'});
 my $server_id = &get_domain_mail_server($d);
 
-# Re-enable Postfix transport on remote
-my $err = &enable_remote_postfix($d, $server_id);
-if ($err) {
-	&$virtual_server::second_print(&text('enable_err', $err));
+my ($out, $exit) = &remote_virtualmin_cmd($server_id,
+	"enable-domain", "--domain", $d->{'dom'});
+if ($exit) {
+	&$virtual_server::second_print(&text('enable_err', $out));
 	return 0;
 	}
 &$virtual_server::second_print($virtual_server::text{'setup_done'});
@@ -409,9 +409,9 @@ if (!$state || !$state->{'server_id'}) {
 if (!$state->{'dns_configured'}) {
 	return $text{'validate_enodns'};
 	}
-# Check Postfix
-if (!$state->{'postfix_configured'}) {
-	return $text{'validate_enopostfix'};
+# Check that domain was created on remote server
+if (!$state->{'domain_created'}) {
+	return $text{'validate_enodomain'};
 	}
 return undef;
 }
@@ -666,8 +666,7 @@ else {
 	}
 }
 
-# ---- Stub functions for later phases ----
-# These will be implemented in phases 3-8.
+# ---- DNS Record Management (on vh1) ----
 
 # setup_remote_mail_dns(&domain, \%server)
 # Creates DNS records: MX, A for mail hosts, SPF TXT, and autoconfig CNAME.
@@ -783,6 +782,77 @@ eval {
 return $@ ? "$@" : undef;
 }
 
+# setup_dkim_dns_record(&domain, $selector, $pubkey)
+# Creates DKIM TXT record on vh1's DNS. The DKIM key is generated on email1
+# by Virtualmin; this function only creates the corresponding DNS record.
+sub setup_dkim_dns_record
+{
+my ($d, $selector, $pubkey) = @_;
+return undef if (!$d->{'dns'} || !$pubkey);
+
+eval {
+	if (defined(&virtual_server::obtain_lock_dns)) {
+		&virtual_server::obtain_lock_dns($d, 1);
+		}
+
+	my ($recs, $file) = &virtual_server::get_domain_dns_records_and_file($d);
+	return undef if (!$file);
+
+	my ($dkim_name, $dkim_value) = &build_dkim_record(
+		$d->{'dom'}, $selector, $pubkey);
+
+	# Remove existing DKIM records for this selector
+	foreach my $r (@$recs) {
+		if ($r->{'type'} eq 'TXT' &&
+		    $r->{'name'} =~ /\._domainkey\.\Q$d->{'dom'}\E\.?$/) {
+			&virtual_server::delete_dns_record($recs, $file, $r);
+			}
+		}
+
+	&virtual_server::create_dns_record($recs, $file,
+		{ 'name' => "${dkim_name}.",
+		  'type' => 'TXT',
+		  'values' => [ "\"$dkim_value\"" ] });
+
+	if (defined(&virtual_server::post_records_change)) {
+		&virtual_server::post_records_change($d, $recs, $file);
+		}
+	else {
+		&virtual_server::register_post_action(
+			\&virtual_server::restart_bind);
+		}
+
+	if (defined(&virtual_server::release_lock_dns)) {
+		&virtual_server::release_lock_dns($d, 1);
+		}
+	};
+
+return $@ ? "$@" : undef;
+}
+
+# get_remote_dkim_public_key($server_id, $domain, $selector)
+# Fetches the DKIM public key from the remote mail server.
+sub get_remote_dkim_public_key
+{
+my ($server_id, $domain, $selector) = @_;
+$selector ||= '202307';
+my $keyfile = "/etc/opendkim/keys/${domain}/${selector}.txt";
+
+my ($out, $exit) = &remote_mail_cmd($server_id, "cat ${keyfile} 2>/dev/null");
+if ($exit != 0 || !$out) {
+	return undef;
+	}
+
+# Extract the public key from the TXT record file
+# Format: selector._domainkey IN TXT ( "v=DKIM1; k=rsa; " "p=MIIBi..." )
+my $pubkey = '';
+if ($out =~ /p=([A-Za-z0-9+\/=\s"]+)/) {
+	$pubkey = $1;
+	$pubkey =~ s/[")\s]//g;
+	}
+return $pubkey;
+}
+
 # delete_remote_mail_dns(&domain, \%server)
 # Removes all DNS records added by setup_remote_mail_dns
 sub delete_remote_mail_dns
@@ -876,418 +946,10 @@ eval {
 return $@ ? "$@" : undef;
 }
 
-# modify_remote_mail_dns(&domain, &old_domain, \%server)
-# Update DNS records when domain is renamed — delete old, create new
-sub modify_remote_mail_dns
-{
-my ($d, $oldd, $server) = @_;
-my $err = &delete_remote_mail_dns($oldd, $server);
-return $err if ($err);
-return &setup_remote_mail_dns($d, $server);
-}
-
-# ---- Phase 4: Remote Postfix Configuration ----
-
-# setup_remote_postfix(&domain, $server_id, \%server)
-# Configures Postfix on the remote server:
-# - Adds domain to virtual_domains
-# - Adds sender-dependent transport map entry for outgoing relay
-# - Runs postmap and reloads Postfix
-sub setup_remote_postfix
-{
-my ($d, $server_id, $server) = @_;
-my $dom = $d->{'dom'};
-
-# Merge domain overrides with server defaults
-$server = &get_effective_mail_config($d, $server);
-
-eval {
-	# Add to virtual_domains (hash map file)
-	&remote_mail_ssh($server_id,
-		"postconf -h virtual_mailbox_domains 2>/dev/null");
-
-	# Add domain to virtual_mailbox_domains via hash file
-	my $cmd = "grep -q '^\Q${dom}\E\\b' /etc/postfix/virtual_domains 2>/dev/null" .
-	          " || echo '${dom} OK' >> /etc/postfix/virtual_domains" .
-	          " && postmap /etc/postfix/virtual_domains";
-	my ($out, $exit) = &remote_mail_ssh($server_id, $cmd);
-	if ($exit != 0) {
-		die "Failed to add virtual domain: $out";
-		}
-
-	# Add sender-dependent transport map for outgoing relay
-	if ($server->{'outgoing_relay'}) {
-		my $relay = $server->{'outgoing_relay'};
-		my $port = $server->{'outgoing_relay_port'} || 25;
-		# Defense-in-depth: strip any shell-unsafe chars (validation
-		# should have already rejected bad input, but belt-and-suspenders)
-		$relay =~ s/[^a-zA-Z0-9.\-]//g;
-		$port =~ s/[^0-9]//g;
-		$port = 25 if (!$port);
-		my $transport = "smtp:[${relay}]:${port}";
-		$cmd = "grep -q '^\@\Q${dom}\E\\b' /etc/postfix/dependent 2>/dev/null" .
-		       " || echo '\@${dom} ${transport}' >> /etc/postfix/dependent" .
-		       " && postmap /etc/postfix/dependent";
-		($out, $exit) = &remote_mail_ssh($server_id, $cmd);
-		if ($exit != 0) {
-			die "Failed to add sender transport: $out";
-			}
-		}
-
-	# Reload Postfix
-	($out, $exit) = &remote_mail_ssh($server_id, "systemctl reload postfix");
-	if ($exit != 0) {
-		die "Failed to reload Postfix: $out";
-		}
-	};
-
-return $@ ? "$@" : undef;
-}
-
-# delete_remote_postfix(&domain, $server_id, \%server)
-# Removes Postfix configuration for a domain from the remote server
-sub delete_remote_postfix
-{
-my ($d, $server_id, $server) = @_;
-my $dom = $d->{'dom'};
-
-eval {
-	# Remove from virtual_domains
-	my $cmd = "sed -i '/^\Q${dom}\E\\b/d' /etc/postfix/virtual_domains 2>/dev/null" .
-	          " && postmap /etc/postfix/virtual_domains";
-	my ($out, $exit) = &remote_mail_ssh($server_id, $cmd);
-
-	# Remove from sender-dependent transport
-	$cmd = "sed -i '/^\@\Q${dom}\E\\b/d' /etc/postfix/dependent 2>/dev/null" .
-	       " && postmap /etc/postfix/dependent";
-	($out, $exit) = &remote_mail_ssh($server_id, $cmd);
-
-	# Remove any virtual_mailbox entries for the domain
-	$cmd = "sed -i '/\@\Q${dom}\E\\b/d' /etc/postfix/virtual_mailbox 2>/dev/null" .
-	       " && postmap /etc/postfix/virtual_mailbox 2>/dev/null";
-	($out, $exit) = &remote_mail_ssh($server_id, $cmd);
-
-	# Remove virtual alias entries
-	$cmd = "sed -i '/\@\Q${dom}\E\\b/d' /etc/postfix/virtual_alias 2>/dev/null" .
-	       " && postmap /etc/postfix/virtual_alias 2>/dev/null";
-	($out, $exit) = &remote_mail_ssh($server_id, $cmd);
-
-	# Reload
-	($out, $exit) = &remote_mail_ssh($server_id, "systemctl reload postfix");
-	};
-
-return $@ ? "$@" : undef;
-}
-
-# modify_remote_postfix(&domain, &old_domain, $server_id, \%server)
-# Updates Postfix config when domain is renamed
-sub modify_remote_postfix
-{
-my ($d, $oldd, $server_id, $server) = @_;
-my $err = &delete_remote_postfix($oldd, $server_id, $server);
-return $err if ($err);
-return &setup_remote_postfix($d, $server_id, $server);
-}
-
-# disable_remote_postfix(&domain, $server_id)
-# Temporarily disables mail delivery by commenting out virtual_domains entry
-sub disable_remote_postfix
-{
-my ($d, $server_id) = @_;
-my $dom = $d->{'dom'};
-eval {
-	my $cmd = "sed -i 's/^\Q${dom}\E\\b/#DISABLED# ${dom}/' /etc/postfix/virtual_domains" .
-	          " && postmap /etc/postfix/virtual_domains" .
-	          " && systemctl reload postfix";
-	my ($out, $exit) = &remote_mail_ssh($server_id, $cmd);
-	if ($exit != 0) {
-		die "Failed to disable domain in Postfix: $out";
-		}
-	};
-return $@ ? "$@" : undef;
-}
-
-# enable_remote_postfix(&domain, $server_id)
-# Re-enables mail delivery by uncommenting virtual_domains entry
-sub enable_remote_postfix
-{
-my ($d, $server_id) = @_;
-my $dom = $d->{'dom'};
-eval {
-	my $cmd = "sed -i 's/^#DISABLED# \Q${dom}\E/${dom} OK/' /etc/postfix/virtual_domains" .
-	          " && postmap /etc/postfix/virtual_domains" .
-	          " && systemctl reload postfix";
-	my ($out, $exit) = &remote_mail_ssh($server_id, $cmd);
-	if ($exit != 0) {
-		die "Failed to enable domain in Postfix: $out";
-		}
-	};
-return $@ ? "$@" : undef;
-}
-
-# ---- Phase 5: Remote Dovecot / User Management ----
-
-# setup_remote_dovecot(&domain, $server_id, \%server)
-# Creates the domain's home directory and initial Maildir on the remote server
-sub setup_remote_dovecot
-{
-my ($d, $server_id, $server) = @_;
-my $dom = $d->{'dom'};
-my $maildir = $server->{'maildir_format'} || '.maildir';
-
-eval {
-	# Create domain home and maildir
-	my $home = "/home/${dom}";
-	my $cmd = "mkdir -p ${home}/${maildir}/{cur,new,tmp}" .
-	          " && chmod -R 700 ${home}/${maildir}";
-	my ($out, $exit) = &remote_mail_ssh($server_id, $cmd);
-	if ($exit != 0) {
-		die "Failed to create maildir: $out";
-		}
-	};
-
-return $@ ? "$@" : undef;
-}
-
-# delete_remote_dovecot(&domain, $server_id, \%server)
-# Removes the domain's mail home from the remote server.
-# Note: Does NOT delete data by default — renames to .deleted for safety.
-sub delete_remote_dovecot
-{
-my ($d, $server_id, $server) = @_;
-my $dom = $d->{'dom'};
-
-eval {
-	my $home = "/home/${dom}";
-	my $ts = time();
-	my $cmd = "[ -d ${home} ] && mv ${home} ${home}.deleted.${ts} || true";
-	my ($out, $exit) = &remote_mail_ssh($server_id, $cmd);
-	if ($exit != 0) {
-		die "Failed to archive mail home: $out";
-		}
-	};
-
-return $@ ? "$@" : undef;
-}
-
-# create_remote_mail_user(&domain, $server_id, $user, $password, \%opts)
-# Creates a mailbox user on the remote server:
-# - Adds virtual_mailbox entry
-# - Creates Maildir
-# - Sets password in Dovecot passwd file
-sub create_remote_mail_user
-{
-my ($d, $server_id, $user, $password, $opts) = @_;
-my $dom = $d->{'dom'};
-my $email = "${user}\@${dom}";
-my $server = &get_remote_mail_server($server_id);
-my $maildir = $server->{'maildir_format'} || '.maildir';
-my $home = "/home/${dom}";
-my $userdir = "${home}/${maildir}/${user}";
-
-eval {
-	# Create user maildir
-	my $cmd = "mkdir -p ${userdir}/{cur,new,tmp} && chmod -R 700 ${userdir}";
-	my ($out, $exit) = &remote_mail_ssh($server_id, $cmd);
-	if ($exit != 0) {
-		die "Failed to create user maildir: $out";
-		}
-
-	# Add virtual_mailbox entry
-	$cmd = "grep -q '^\Q${email}\E\\b' /etc/postfix/virtual_mailbox 2>/dev/null" .
-	       " || echo '${email} ${dom}/${maildir}/${user}/' >> /etc/postfix/virtual_mailbox" .
-	       " && postmap /etc/postfix/virtual_mailbox";
-	($out, $exit) = &remote_mail_ssh($server_id, $cmd);
-	if ($exit != 0) {
-		die "Failed to add virtual mailbox: $out";
-		}
-
-	# Generate password hash and add to Dovecot passwd file
-	if ($password) {
-		$cmd = "doveadm pw -s SSHA512 -p " . quotemeta($password);
-		($out, $exit) = &remote_mail_ssh($server_id, $cmd);
-		chomp($out);
-		if ($exit != 0) {
-			die "Failed to generate password hash: $out";
-			}
-		my $hash = $out;
-
-		# Append to passwd file (or update existing)
-		$cmd = "grep -q '^\Q${email}\E:' /etc/dovecot/users 2>/dev/null" .
-		       " && sed -i 's|^\Q${email}\E:.*|${email}:${hash}::::${userdir}|' /etc/dovecot/users" .
-		       " || echo '${email}:${hash}::::${userdir}' >> /etc/dovecot/users";
-		($out, $exit) = &remote_mail_ssh($server_id, $cmd);
-		if ($exit != 0) {
-			die "Failed to set user password: $out";
-			}
-		}
-
-	# Reload Postfix to pick up virtual_mailbox changes
-	&remote_mail_ssh($server_id, "systemctl reload postfix");
-	};
-
-return $@ ? "$@" : undef;
-}
-
-# delete_remote_mail_user(&domain, $server_id, $user)
-# Removes a mailbox user from the remote server
-sub delete_remote_mail_user
-{
-my ($d, $server_id, $user) = @_;
-my $dom = $d->{'dom'};
-my $email = "${user}\@${dom}";
-
-eval {
-	# Remove from virtual_mailbox
-	my $cmd = "sed -i '/^\Q${email}\E\\b/d' /etc/postfix/virtual_mailbox 2>/dev/null" .
-	          " && postmap /etc/postfix/virtual_mailbox";
-	my ($out, $exit) = &remote_mail_ssh($server_id, $cmd);
-
-	# Remove from Dovecot passwd
-	$cmd = "sed -i '/^\Q${email}\E:/d' /etc/dovecot/users 2>/dev/null";
-	($out, $exit) = &remote_mail_ssh($server_id, $cmd);
-
-	# Remove virtual alias entries for this user
-	$cmd = "sed -i '/^\Q${email}\E\\b/d' /etc/postfix/virtual_alias 2>/dev/null" .
-	       " && postmap /etc/postfix/virtual_alias 2>/dev/null";
-	($out, $exit) = &remote_mail_ssh($server_id, $cmd);
-
-	&remote_mail_ssh($server_id, "systemctl reload postfix");
-	};
-
-return $@ ? "$@" : undef;
-}
-
-# list_remote_mail_users(&domain, $server_id)
-# Returns a list of mail users for the domain from the remote server
-sub list_remote_mail_users
-{
-my ($d, $server_id) = @_;
-my $dom = $d->{'dom'};
-my @users;
-
-my ($out, $exit) = &remote_mail_ssh($server_id,
-	"grep '\@\Q${dom}\E:' /etc/dovecot/users 2>/dev/null");
-if ($exit == 0 && $out) {
-	foreach my $line (split(/\n/, $out)) {
-		if ($line =~ /^([^@]+)\@\Q${dom}\E:/) {
-			push(@users, $1);
-			}
-		}
-	}
-
-return @users;
-}
-
-# ---- Phase 6: DKIM Integration ----
-
-# setup_remote_dkim(&domain, $server_id, \%server)
-# Configures OpenDKIM on the remote server for this domain:
-# - Generates key pair if needed
-# - Adds signing table and key table entries
-# - Reloads OpenDKIM
-sub setup_remote_dkim
-{
-my ($d, $server_id, $server) = @_;
-my $dom = $d->{'dom'};
-my $selector = $server->{'dkim_selector'} || '202307';
-
-eval {
-	my $keydir = "/etc/opendkim/keys/${dom}";
-
-	# Create key directory and generate key if not exists
-	my $cmd = "mkdir -p ${keydir}" .
-	          " && [ -f ${keydir}/${selector}.private ] ||" .
-	          " opendkim-genkey -s ${selector} -d ${dom} -D ${keydir}" .
-	          " && chown -R opendkim:opendkim ${keydir}";
-	my ($out, $exit) = &remote_mail_ssh($server_id, $cmd);
-	if ($exit != 0) {
-		die "Failed to generate DKIM key: $out";
-		}
-
-	# Add signing table entry
-	$cmd = "grep -q '\Q${dom}\E' /etc/opendkim/signing.table 2>/dev/null" .
-	       " || echo '*\@${dom} ${selector}._domainkey.${dom}'" .
-	       " >> /etc/opendkim/signing.table";
-	($out, $exit) = &remote_mail_ssh($server_id, $cmd);
-	if ($exit != 0) {
-		die "Failed to add signing table entry: $out";
-		}
-
-	# Add key table entry
-	$cmd = "grep -q '\Q${dom}\E' /etc/opendkim/key.table 2>/dev/null" .
-	       " || echo '${selector}._domainkey.${dom} ${dom}:${selector}:${keydir}/${selector}.private'" .
-	       " >> /etc/opendkim/key.table";
-	($out, $exit) = &remote_mail_ssh($server_id, $cmd);
-	if ($exit != 0) {
-		die "Failed to add key table entry: $out";
-		}
-
-	# Reload OpenDKIM
-	($out, $exit) = &remote_mail_ssh($server_id,
-		"systemctl reload opendkim 2>/dev/null || systemctl restart opendkim");
-	if ($exit != 0) {
-		die "Failed to reload OpenDKIM: $out";
-		}
-	};
-
-return $@ ? "$@" : undef;
-}
-
-# get_remote_dkim_public_key($server_id, $domain, $selector)
-# Fetches the DKIM public key from the remote server
-sub get_remote_dkim_public_key
-{
-my ($server_id, $domain, $selector) = @_;
-$selector ||= '202307';
-my $keyfile = "/etc/opendkim/keys/${domain}/${selector}.txt";
-
-my ($out, $exit) = &remote_mail_ssh($server_id, "cat ${keyfile} 2>/dev/null");
-if ($exit != 0 || !$out) {
-	return undef;
-	}
-
-# Extract the public key from the TXT record file
-# Format: selector._domainkey IN TXT ( "v=DKIM1; k=rsa; " "p=MIIBi..." )
-my $pubkey = '';
-if ($out =~ /p=([A-Za-z0-9+\/=\s"]+)/) {
-	$pubkey = $1;
-	$pubkey =~ s/[")\s]//g;
-	}
-return $pubkey;
-}
-
-# delete_remote_dkim(&domain, $server_id, \%server)
-# Removes OpenDKIM configuration for a domain
-sub delete_remote_dkim
-{
-my ($d, $server_id, $server) = @_;
-my $dom = $d->{'dom'};
-
-eval {
-	# Remove signing table entry
-	my $cmd = "sed -i '/\Q${dom}\E/d' /etc/opendkim/signing.table 2>/dev/null";
-	my ($out, $exit) = &remote_mail_ssh($server_id, $cmd);
-
-	# Remove key table entry
-	$cmd = "sed -i '/\Q${dom}\E/d' /etc/opendkim/key.table 2>/dev/null";
-	($out, $exit) = &remote_mail_ssh($server_id, $cmd);
-
-	# Note: we keep the key files for potential reuse
-
-	# Reload OpenDKIM
-	($out, $exit) = &remote_mail_ssh($server_id,
-		"systemctl reload opendkim 2>/dev/null || systemctl restart opendkim");
-	};
-
-return $@ ? "$@" : undef;
-}
-
-# ---- Phase 7: SSL Certificate Sync ----
+# ---- SSL Certificate Sync ----
 
 # sync_remote_mail_ssl(&domain, $server_id)
-# Syncs SSL certificates from vh1 to the remote mail server via SCP.
-# Reloads Dovecot and Postfix on the remote server.
+# Syncs SSL certificates from vh1 to the remote mail server via Webmin RPC.
 sub sync_remote_mail_ssl
 {
 my ($d, $server_id) = @_;
@@ -1296,75 +958,42 @@ my $server = &get_remote_mail_server($server_id);
 return "Server not found" if (!$server);
 
 eval {
-	# Determine cert paths on vh1 (Virtualmin stores these in domain hash)
 	my $cert = $d->{'ssl_cert'} || "/home/${dom}/ssl.cert";
 	my $key  = $d->{'ssl_key'}  || "/home/${dom}/ssl.key";
 	my $ca   = $d->{'ssl_chain'} || $d->{'ssl_ca'};
 
-	# Verify cert exists locally
 	if (! -r $cert) {
 		die "SSL certificate not found at $cert";
 		}
 
-	my $ssh_host = $server->{'ssh_host'} || $server->{'host'};
-	my $ssh_user = $server->{'ssh_user'} || 'root';
-	my $ssh_key  = $server->{'ssh_key'};
-
-	my @scp_opts = ('-o', 'StrictHostKeyChecking=no',
-	                '-o', 'BatchMode=yes',
-	                '-o', 'ConnectTimeout=10');
-	push(@scp_opts, '-i', $ssh_key) if ($ssh_key);
-
 	my $remote_dir = "/etc/ssl/mail/${dom}";
-	my $dest = "${ssh_user}\@${ssh_host}";
 
-	# Create remote directory
-	my ($out, $exit) = &remote_mail_ssh($server_id,
+	my ($out, $exit) = &remote_mail_cmd($server_id,
 		"mkdir -p ${remote_dir} && chmod 700 ${remote_dir}");
 	if ($exit != 0) {
 		die "Failed to create remote SSL directory: $out";
 		}
 
-	# SCP cert and key
-	my $scp_base = "scp " . join(' ', map { quotemeta($_) } @scp_opts);
-	$out = &backquote_command(
-		"${scp_base} " . quotemeta($cert) .
-		" ${dest}:${remote_dir}/fullchain.pem 2>&1");
-	if ($?) {
-		die "Failed to copy certificate: $out";
-		}
+	&remote_mail_write($server_id, $cert, "${remote_dir}/fullchain.pem");
+	&remote_mail_write($server_id, $key, "${remote_dir}/privkey.pem");
 
-	$out = &backquote_command(
-		"${scp_base} " . quotemeta($key) .
-		" ${dest}:${remote_dir}/privkey.pem 2>&1");
-	if ($?) {
-		die "Failed to copy private key: $out";
-		}
-
-	# Copy CA chain if available
 	if ($ca && -r $ca) {
-		$out = &backquote_command(
-			"${scp_base} " . quotemeta($ca) .
-			" ${dest}:${remote_dir}/chain.pem 2>&1");
+		&remote_mail_write($server_id, $ca, "${remote_dir}/chain.pem");
 		}
 
-	# Set permissions on remote
-	&remote_mail_ssh($server_id,
-		"chmod 600 ${remote_dir}/*.pem");
+	&remote_mail_cmd($server_id, "chmod 600 ${remote_dir}/*.pem");
 
-	# Reload Dovecot and Postfix to pick up new certs
-	($out, $exit) = &remote_mail_ssh($server_id,
+	($out, $exit) = &remote_mail_cmd($server_id,
 		"systemctl reload dovecot 2>/dev/null; systemctl reload postfix 2>/dev/null");
 	};
 
 return $@ ? "$@" : undef;
 }
 
-# ---- Phase 8: Disk Usage ----
+# ---- Disk Usage ----
 
 # get_remote_disk_usage(&domain, $server_id)
 # Returns disk usage in bytes for the domain's mail directory on the remote server.
-# Results are cached for the configured TTL.
 sub get_remote_disk_usage
 {
 my ($d, $server_id) = @_;
@@ -1372,7 +1001,6 @@ my $dom = $d->{'dom'};
 my $cache_file = "$domains_dir/${dom}.du";
 my $cache_ttl = $config{'disk_usage_cache'} || 3600;
 
-# Check cache
 if (-r $cache_file) {
 	my @stat = stat($cache_file);
 	if (time() - $stat[9] < $cache_ttl) {
@@ -1384,15 +1012,13 @@ if (-r $cache_file) {
 		}
 	}
 
-# Fetch from remote
-my ($out, $exit) = &remote_mail_ssh($server_id,
+my ($out, $exit) = &remote_mail_cmd($server_id,
 	"du -sb /home/${dom} 2>/dev/null | cut -f1");
 my $bytes = 0;
 if ($exit == 0 && $out =~ /^(\d+)/) {
 	$bytes = $1;
 	}
 
-# Cache result
 if (! -d $domains_dir) {
 	&make_dir($domains_dir, 0700);
 	}
@@ -1410,21 +1036,68 @@ return $bytes;
 sub rollback_setup
 {
 my ($d, $server_id, $state) = @_;
-my $server = &get_remote_mail_server($server_id);
 
-if ($state->{'dkim_configured'} && $server) {
-	eval { &delete_remote_dkim($d, $server_id, $server) };
+# Delete the domain on email1 if it was created
+if ($state->{'domain_created'}) {
+	eval {
+		&remote_virtualmin_cmd($server_id,
+			"delete-domain", "--domain", $d->{'dom'});
+		};
 	}
-if ($state->{'dovecot_configured'} && $server) {
-	eval { &delete_remote_dovecot($d, $server_id, $server) };
-	}
-if ($state->{'postfix_configured'} && $server) {
-	eval { &delete_remote_postfix($d, $server_id, $server) };
-	}
+
+# Remove DNS records on vh1 if they were created
 if ($state->{'dns_configured'}) {
+	my $server = &get_remote_mail_server($server_id);
 	eval { &delete_remote_mail_dns($d, $server) };
 	}
+
 &delete_domain_state($d->{'dom'});
+}
+
+# ---- Plugin User Management ----
+
+# list_plugin_users(&domain)
+# Returns a list of remote mail user hashes for display in Virtualmin's
+# users table. Uses Virtualmin's list-users API for full user data.
+sub list_plugin_users
+{
+my ($d) = @_;
+my $server_id = &get_domain_mail_server($d);
+return () if (!$server_id);
+my @user_data = eval { &list_remote_mail_users($d, $server_id) };
+return () if ($@ || !@user_data);
+my @users;
+foreach my $u (@user_data) {
+	my $username = $u->{'_name'};
+	push(@users, {
+		'user' => $username.'@'.$d->{'dom'},
+		'email' => $u->{'email_address'} || $username.'@'.$d->{'dom'},
+		'real' => $u->{'real_name'} || $text{'feat_remote_user_type'},
+		'extra' => 1,
+		'type' => $module_name,
+		'plugin' => $module_name,
+		'noquota' => 1,
+		'noprimary' => 1,
+		'noextra' => 1,
+		'noalias' => 1,
+		'nocreatehome' => 1,
+		'nomailfile' => 1,
+		'edit_url' => "/$module_name/edit_user.cgi?dom=".
+			      &urlize($d->{'dom'}).
+			      "&user=".&urlize($username),
+		'dom' => $d,
+		});
+	}
+return @users;
+}
+
+# users_create_links(&domain)
+# Returns links for the "Add" buttons on the users listing page.
+sub users_create_links
+{
+my ($d) = @_;
+return ([ "/$module_name/edit_user.cgi?dom=".&urlize($d->{'dom'}),
+	  $text{'feat_add_user'} ]);
 }
 
 1;

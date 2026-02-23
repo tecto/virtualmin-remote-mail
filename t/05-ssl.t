@@ -1,5 +1,5 @@
 #!/usr/bin/perl
-# 05-ssl.t — Test SSL sync, DKIM, and disk usage operations
+# 05-ssl.t — Test SSL sync and disk usage operations
 use strict;
 use warnings;
 use FindBin;
@@ -12,62 +12,31 @@ load_plugin_lib("$FindBin::Bin/../virtualmin-remote-mail-lib.pl");
 $main::domains_dir = "$main::module_config_directory/domains";
 load_plugin_feature("$FindBin::Bin/../virtual_feature.pl");
 
-# Helper: join all captured commands and strip backslash escaping
+# Helper: extract shell commands from RPC calls (backquote_command args)
+# and strip backslash escaping for easier regex matching
 sub captured_cmds {
-    my $raw = join("\n", @main::_commands_run);
-    $raw =~ s/\\(.)/$1/g;
+    my @cmds;
+    foreach my $call (@main::_rpc_calls) {
+        if ($call->{'func'} eq 'backquote_command') {
+            push(@cmds, $call->{'args'}[0]);
+            }
+        }
+    my $raw = join("\n", @cmds);
+    $raw =~ s/\\(.)/$1/g;   # remove backslash escapes
     return $raw;
 }
 
 # Set up a test server
 save_remote_mail_server('1', {
-    host         => 'vh2.trinsik.io',
-    webmin_host  => 'vh2.trinsik.io',
-    ssh_host     => 'vh2.trinsik.io',
-    ssh_user     => 'root',
-    ssh_key      => '/root/.ssh/id_rsa',
+    host         => 'email1.trinsik.io',
+    webmin_host  => 'email1.trinsik.io',
+    webmin_port  => 10000,
+    webmin_ssl   => 1,
+    webmin_user  => 'root',
+    webmin_pass  => 'secret',
     dkim_selector => '202307',
-    maildir_format => '.maildir',
     default      => 1,
 });
-
-# =========================================
-# Test: DKIM setup
-# =========================================
-
-subtest 'setup_remote_dkim' => sub {
-    plan tests => 5;
-
-    @main::_commands_run = ();
-    my $d = { 'dom' => 'testdomain.com', 'dns' => 1 };
-    my $server = get_remote_mail_server('1');
-    my $err = setup_remote_dkim($d, '1', $server);
-    is($err, undef, 'setup_remote_dkim succeeds');
-
-    my $cmds = captured_cmds();
-    like($cmds, qr/opendkim-genkey/, 'Generates DKIM key');
-    like($cmds, qr/signing\.table/, 'Adds signing table entry');
-    like($cmds, qr/key\.table/, 'Adds key table entry');
-    like($cmds, qr/reload opendkim|restart opendkim/, 'Reloads OpenDKIM');
-};
-
-# =========================================
-# Test: delete_remote_dkim
-# =========================================
-
-subtest 'delete_remote_dkim' => sub {
-    plan tests => 3;
-
-    @main::_commands_run = ();
-    my $d = { 'dom' => 'testdomain.com' };
-    my $server = get_remote_mail_server('1');
-    my $err = delete_remote_dkim($d, '1', $server);
-    is($err, undef, 'delete_remote_dkim succeeds');
-
-    my $cmds = captured_cmds();
-    like($cmds, qr/signing\.table/, 'Removes signing table entry');
-    like($cmds, qr/key\.table/, 'Removes key table entry');
-};
 
 # =========================================
 # Test: get_remote_dkim_public_key
@@ -77,7 +46,7 @@ subtest 'get_remote_dkim_public_key' => sub {
     plan tests => 1;
 
     my $key = get_remote_dkim_public_key('1', 'testdomain.com', '202307');
-    # Mock SSH returns "ok\n", which has no DKIM key format — returns empty string
+    # Mock returns "ok\n", which has no DKIM key format — returns empty string
     ok(!$key, 'Returns falsy when key file not in expected format');
 };
 
@@ -86,7 +55,7 @@ subtest 'get_remote_dkim_public_key' => sub {
 # =========================================
 
 subtest 'sync_remote_mail_ssl' => sub {
-    plan tests => 2;
+    plan tests => 5;
 
     # Create temp cert files
     my $tmpdir = tempdir(CLEANUP => 1);
@@ -97,7 +66,8 @@ subtest 'sync_remote_mail_ssl' => sub {
     print $fh "KEY DATA\n";
     close($fh);
 
-    @main::_commands_run = ();
+    @main::_rpc_calls = ();
+    @main::_files_written = ();
     my $d = {
         'dom'       => 'testdomain.com',
         'ssl_cert'  => "$tmpdir/ssl.cert",
@@ -108,6 +78,12 @@ subtest 'sync_remote_mail_ssl' => sub {
 
     my $cmds = captured_cmds();
     like($cmds, qr/ssl.*mail|mkdir/, 'Creates remote SSL directory');
+
+    # Verify file transfers via remote_write
+    ok(scalar @main::_files_written >= 2, 'At least 2 files written via RPC');
+    my @remotes = map { $_->{'remote'} } @main::_files_written;
+    ok(grep(/fullchain\.pem/, @remotes), 'fullchain.pem transferred');
+    ok(grep(/privkey\.pem/, @remotes), 'privkey.pem transferred');
 };
 
 # =========================================
@@ -135,7 +111,7 @@ subtest 'get_remote_disk_usage' => sub {
 
     my $d = { 'dom' => 'testdomain.com' };
     my $bytes = get_remote_disk_usage($d, '1');
-    # Mock SSH returns "ok\n" which won't parse as digits, so 0
+    # Mock returns "ok\n" which won't parse as digits, so 0
     is($bytes, 0, 'Returns 0 when du output is not numeric');
 
     # Verify caching — file should exist

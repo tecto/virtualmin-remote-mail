@@ -109,7 +109,35 @@ return $servers[0] if (@servers);
 return undef;
 }
 
-# ---- RPC and SSH Wrappers ----
+# ---- RPC Wrappers ----
+
+# _build_rpc_server(\%server)
+# Builds a Webmin RPC connection hash from server config fields.
+# Shared helper used by remote_mail_call() and remote_mail_cmd().
+sub _build_rpc_server
+{
+my ($server) = @_;
+return { 'host' => $server->{'webmin_host'} || $server->{'host'},
+         'port' => $server->{'webmin_port'} || 10000,
+         'ssl'  => $server->{'webmin_ssl'},
+         'user' => $server->{'webmin_user'},
+         'pass' => $server->{'webmin_pass'} };
+}
+
+# _ensure_rpc_session($serv)
+# Ensures a Webmin RPC session is established for the given server hash.
+# Calls remote_foreign_require once per server to create a FIFO session
+# on the remote side. Subsequent remote_foreign_call requests will reuse it.
+our %_rpc_initialized;
+sub _ensure_rpc_session
+{
+my ($serv) = @_;
+my $key = ($serv->{'host'} || '') . ':' . ($serv->{'port'} || 10000);
+if (!$_rpc_initialized{$key}) {
+	&remote_foreign_require($serv, 'webmin');
+	$_rpc_initialized{$key} = 1;
+	}
+}
 
 # remote_mail_call($server_id, $module, $func, @args)
 # Wrapper around remote_foreign_call to the mail server's Webmin
@@ -119,43 +147,241 @@ my ($server_id, $module, $func, @args) = @_;
 my $server = &get_remote_mail_server($server_id);
 return undef if (!$server);
 
-my $serv = { 'host' => $server->{'webmin_host'} || $server->{'host'},
-             'port' => $server->{'webmin_port'} || 10000,
-             'ssl'  => $server->{'webmin_ssl'},
-             'user' => $server->{'webmin_user'},
-             'pass' => $server->{'webmin_pass'} };
-
+my $serv = &_build_rpc_server($server);
+&_ensure_rpc_session($serv);
 return &remote_foreign_call($serv, $module, $func, @args);
 }
 
-# remote_mail_ssh($server_id, $command)
-# Executes a command on the remote server via SSH.
-# Returns ($output, $exit_code).
-sub remote_mail_ssh
+# remote_mail_cmd($server_id, $command)
+# Executes a shell command on the remote server via Webmin RPC.
+# Wraps the command with a sentinel to capture the exit code.
+# Returns ($output, $exit_code) — same interface as the old remote_mail_ssh().
+sub remote_mail_cmd
 {
 my ($server_id, $command) = @_;
 my $server = &get_remote_mail_server($server_id);
 return (undef, -1) if (!$server);
 
-my $ssh_host = $server->{'ssh_host'} || $server->{'host'};
-my $ssh_user = $server->{'ssh_user'} || 'root';
-my $ssh_key  = $server->{'ssh_key'};
+my $serv = &_build_rpc_server($server);
+&_ensure_rpc_session($serv);
 
-my @cmd = ('ssh');
-push(@cmd, '-i', $ssh_key) if ($ssh_key);
-push(@cmd, '-o', 'StrictHostKeyChecking=no');
-push(@cmd, '-o', 'BatchMode=yes');
-push(@cmd, '-o', 'ConnectTimeout=10');
-push(@cmd, "${ssh_user}\@${ssh_host}");
-push(@cmd, $command);
+# Wrap command with sentinel to capture exit code
+my $wrapped = "($command) 2>&1; echo \"\\n__RC__=\$?\"";
+# remote_foreign_call may return multiple values (backquote_command returns
+# a list of lines in list context through the RPC FIFO layer), so capture
+# in list context and join to get the full output string.
+my $out = join("", &remote_foreign_call($serv, 'webmin', 'backquote_command', $wrapped));
 
-my $out = &backquote_command(join(' ', map { quotemeta($_) } @cmd)." 2>&1");
-my $exit = $?;
-return ($out, $exit >> 8);
+# Parse exit code from sentinel
+my $exit = 0;
+if ($out =~ /__RC__=(\d+)/) {
+	$exit = $1;
+	}
+# Strip the sentinel line from output
+$out =~ s/\n?__RC__=\d+\s*$//s;
+
+return ($out, $exit);
+}
+
+# remote_mail_write($server_id, $local_file, $remote_file)
+# Transfers a file to the remote server via Webmin RPC.
+# Replaces SCP for file transfers.
+sub remote_mail_write
+{
+my ($server_id, $local_file, $remote_file) = @_;
+my $server = &get_remote_mail_server($server_id);
+return 0 if (!$server);
+
+my $serv = &_build_rpc_server($server);
+&_ensure_rpc_session($serv);
+return &remote_write($serv, $local_file, $remote_file);
+}
+
+# ---- Virtualmin CLI API Wrappers ----
+# These functions delegate mail server operations to Virtualmin's CLI
+# on the remote server (email1), rather than managing Postfix/Dovecot
+# config files directly.
+
+# _shell_quote($str)
+# Shell-safe single-quoting for command arguments.
+sub _shell_quote
+{
+my ($str) = @_;
+$str =~ s/'/'\\''/g;
+return "'$str'";
+}
+
+# remote_virtualmin_cmd($server_id, $subcmd, @args)
+# Runs `virtualmin $subcmd @args` on the remote server via RPC.
+# @args are alternating --flag / value pairs. Bare flags (no value) are
+# passed through; values are shell-quoted for safety.
+# Returns ($output, $exit_code) — same as remote_mail_cmd().
+sub remote_virtualmin_cmd
+{
+my ($server_id, $subcmd, @args) = @_;
+my @parts = ("virtualmin", $subcmd);
+for (my $i = 0; $i < @args; $i++) {
+	if ($args[$i] =~ /^--/) {
+		push(@parts, $args[$i]);
+		# If next arg is a value (doesn't start with --), quote it
+		if ($i + 1 < @args && $args[$i + 1] !~ /^--/) {
+			$i++;
+			push(@parts, &_shell_quote($args[$i]));
+			}
+		}
+	}
+my $cmd = join(" ", @parts);
+return &remote_mail_cmd($server_id, $cmd);
+}
+
+# parse_multiline_output($output)
+# Parses Virtualmin's --multiline output format into an array of hashrefs.
+# Each entry starts with a non-indented line (stored as '_name') followed
+# by indented "    Key: Value" lines.
+sub parse_multiline_output
+{
+my ($output) = @_;
+return () if (!defined($output) || $output eq '');
+
+my @entries;
+my $current;
+
+foreach my $line (split(/\n/, $output)) {
+	if ($line =~ /^\S/) {
+		# New entry — non-indented line is the entry name
+		push(@entries, $current) if ($current);
+		my $name = $line;
+		$name =~ s/^\s+|\s+$//g;
+		$current = { '_name' => $name };
+		}
+	elsif ($line =~ /^\s+(\S.*?):\s*(.*)$/ && $current) {
+		my ($key, $val) = ($1, $2);
+		# Normalize key: lowercase, spaces to underscores
+		$key = lc($key);
+		$key =~ s/\s+/_/g;
+		$current->{$key} = $val;
+		}
+	}
+push(@entries, $current) if ($current);
+
+return @entries;
+}
+
+# list_remote_mail_users(&domain, $server_id)
+# Returns a list of parsed user hashes for the domain from the remote
+# server, via `virtualmin list-users --domain X --multiline`.
+sub list_remote_mail_users
+{
+my ($d, $server_id) = @_;
+my $dom = $d->{'dom'};
+
+my ($out, $exit) = &remote_virtualmin_cmd($server_id, "list-users",
+	"--domain", $dom, "--multiline");
+return () if ($exit || !$out);
+
+return &parse_multiline_output($out);
+}
+
+# get_remote_mail_user(&domain, $server_id, $username)
+# Returns a single user hash for the given username, or undef if not found.
+sub get_remote_mail_user
+{
+my ($d, $server_id, $username) = @_;
+my $dom = $d->{'dom'};
+
+my ($out, $exit) = &remote_virtualmin_cmd($server_id, "list-users",
+	"--domain", $dom, "--multiline", "--user", $username);
+return undef if ($exit || !$out);
+
+my @entries = &parse_multiline_output($out);
+return $entries[0];
+}
+
+# create_remote_mail_user(&domain, $server_id, $user, $password, \%opts)
+# Creates a mail user on the remote server via `virtualmin create-user`.
+sub create_remote_mail_user
+{
+my ($d, $server_id, $user, $password, $opts) = @_;
+my $dom = $d->{'dom'};
+
+my @args = ("--domain", $dom, "--user", $user);
+push(@args, "--pass", $password) if ($password);
+push(@args, "--real", $opts->{'real'}) if ($opts && $opts->{'real'});
+
+my ($out, $exit) = &remote_virtualmin_cmd($server_id, "create-user", @args);
+return $exit ? "Failed to create user: $out" : undef;
+}
+
+# delete_remote_mail_user(&domain, $server_id, $user)
+# Deletes a mail user on the remote server via `virtualmin delete-user`.
+sub delete_remote_mail_user
+{
+my ($d, $server_id, $user) = @_;
+my $dom = $d->{'dom'};
+
+my ($out, $exit) = &remote_virtualmin_cmd($server_id, "delete-user",
+	"--domain", $dom, "--user", $user);
+return $exit ? "Failed to delete user: $out" : undef;
+}
+
+# modify_remote_mail_user(&domain, $server_id, $username, \%changes)
+# Modifies a mail user on the remote server via `virtualmin modify-user`.
+# %changes keys map to CLI flags:
+#   pass, newuser, real, add_email, remove_email,
+#   add_forward, del_forward, local, no_local,
+#   autoreply, no_autoreply, check_spam, no_check_spam,
+#   disable, enable, recovery, no_recovery, send_update_email
+sub modify_remote_mail_user
+{
+my ($d, $server_id, $username, $changes) = @_;
+my $dom = $d->{'dom'};
+
+my @args = ("--domain", $dom, "--user", $username);
+
+# Flags that take a value
+my @value_flags = (
+	['pass',         'pass'],
+	['newuser',      'newuser'],
+	['real',         'real'],
+	['add_email',    'add-email'],
+	['remove_email', 'remove-email'],
+	['add_forward',  'add-forward'],
+	['del_forward',  'del-forward'],
+	['autoreply',    'autoreply'],
+	['recovery',     'recovery'],
+);
+foreach my $pair (@value_flags) {
+	my ($key, $flag) = @$pair;
+	if (defined $changes->{$key}) {
+		push(@args, "--$flag", $changes->{$key});
+		}
+	}
+
+# Boolean flags (no value)
+my @bool_flags = (
+	['local',             'local'],
+	['no_local',          'no-local'],
+	['no_autoreply',      'no-autoreply'],
+	['check_spam',        'check-spam'],
+	['no_check_spam',     'no-check-spam'],
+	['disable',           'disable'],
+	['enable',            'enable'],
+	['no_recovery',       'no-recovery'],
+	['send_update_email', 'send-update-email'],
+);
+foreach my $pair (@bool_flags) {
+	my ($key, $flag) = @$pair;
+	if ($changes->{$key}) {
+		push(@args, "--$flag");
+		}
+	}
+
+my ($out, $exit) = &remote_virtualmin_cmd($server_id, "modify-user", @args);
+return $exit ? "Failed to modify user: $out" : undef;
 }
 
 # test_remote_mail_server($id)
-# Tests Webmin RPC (if credentials configured) and SSH connectivity.
+# Tests Webmin RPC connectivity by calling get_webmin_version.
 # Returns undef on success, or an error message on failure.
 sub test_remote_mail_server
 {
@@ -163,23 +389,20 @@ my ($id) = @_;
 my $server = &get_remote_mail_server($id);
 return "Server $id not found" if (!$server);
 
-# Test Webmin RPC (only if credentials are configured)
-if ($server->{'webmin_user'} && $server->{'webmin_pass'}) {
-	eval {
-		my $ver = &remote_mail_call($id, 'webmin', 'get_webmin_version');
-		if (!$ver) {
-			die "No response from Webmin RPC";
-			}
-		};
-	if ($@) {
-		return &text('test_erpc', $@);
-		}
+# Require Webmin RPC credentials
+if (!$server->{'webmin_user'} || !$server->{'webmin_pass'}) {
+	return &text('test_erpc', 'Webmin username and password are required');
 	}
 
-# Test SSH
-my ($out, $exit) = &remote_mail_ssh($id, 'echo ok');
-if ($exit != 0 || $out !~ /ok/) {
-	return &text('test_essh', $out || "Connection failed");
+# Test Webmin RPC
+eval {
+	my $ver = &remote_mail_call($id, 'webmin', 'get_webmin_version');
+	if (!$ver) {
+		die "No response from Webmin RPC";
+		}
+	};
+if ($@) {
+	return &text('test_erpc', $@);
 	}
 
 return undef;
@@ -374,6 +597,26 @@ elsif ($key eq 'outgoing_relay_port') {
 return undef;
 }
 
+# ---- Username Validation ----
+
+# validate_mail_username($username)
+# Validates a mail username (the local part before @domain).
+# Returns undef on success, or an error message string on failure.
+sub validate_mail_username
+{
+my ($username) = @_;
+if (!defined($username) || $username eq '') {
+	return "Username is required";
+	}
+# Allow: letters, digits, dots, hyphens, underscores
+# Disallow: leading/trailing dots, consecutive dots, any other chars
+if ($username !~ /^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$/ ||
+    $username =~ /\.\./) {
+	return "Invalid username: only letters, numbers, dots, hyphens, and underscores are allowed";
+	}
+return undef;
+}
+
 # ---- Effective Mail Config (domain overrides + server defaults) ----
 
 # get_effective_mail_config(&domain, \%server)
@@ -449,10 +692,11 @@ if (defined(&virtual_server::release_lock_anything)) {
 sub can_edit_domain
 {
 my ($dname) = @_;
-if ($access{'dom'} eq '*') {
+my $dom_acl = $access{'dom'};
+if (!defined($dom_acl) || $dom_acl eq '' || $dom_acl eq '*') {
 	return 1;
 	}
-return &indexof($dname, split(/\s+/, $access{'dom'})) >= 0;
+return &indexof($dname, split(/\s+/, $dom_acl)) >= 0;
 }
 
 1;

@@ -1,0 +1,74 @@
+Virtualmin Core Patches for Remote Mail Plugin Integration
+==========================================================
+
+These patches modify Virtualmin's virtual-server module to support plugin-
+provided users in the main users listing. They are designed for upstream
+submission as a pull request to the Virtualmin project.
+
+All patches gracefully degrade — if no plugins define the hooks, the code
+is a no-op and behavior is identical to stock Virtualmin.
+
+
+Files
+-----
+
+virtual-server/list_users.cgi
+    Full patched file. Replaces the hardcoded "Add Remote Mail User" link
+    with a generic plugin hook (users_create_links). Any feature plugin
+    can now add user creation links to the users page.
+
+virtual-server/virtual-server-lib-funcs.pl.patch
+    Unified diff for the two changes to virtual-server-lib-funcs.pl
+    (file is ~22000 lines, too large to store in full):
+
+    1. list_domain_users() — Adds a list_plugin_users hook after the
+       existing virtualmin-htpasswd web users block. Feature plugins
+       can return extra user hashes to be merged into the users table.
+
+    2. users_table() — Adds edit_url support. If a user hash contains
+       an 'edit_url' key, that URL is used for the user's name link
+       instead of the default edit_user.cgi link. This lets plugin
+       users link to their own edit pages, and works in both GPL and
+       Pro editions.
+
+
+Plugin-Side Hooks (in virtual_feature.pl)
+-----------------------------------------
+
+list_plugin_users(&domain)
+    Returns a list of user hashes for remote mail users. Each hash has:
+    - user, email: user@domain.tld
+    - real: "Remote mail" type label
+    - extra: 1 (marks as non-Unix user)
+    - type: module name
+    - edit_url: link to plugin's edit_domain.cgi
+    - noquota, noprimary, noextra, noalias, nocreatehome, nomailfile: 1
+
+users_create_links(&domain)
+    Returns an array of link arrays for the "Add" buttons:
+    [ "/virtualmin-remote-mail/edit_user.cgi?dom=...", "Add Remote Mail User" ]
+
+
+Applying Patches
+----------------
+
+On the Virtualmin server:
+
+    # list_users.cgi — copy the full file
+    cp patches/virtual-server/list_users.cgi \
+       /usr/share/webmin/virtual-server/list_users.cgi
+
+    # virtual-server-lib-funcs.pl — apply manually using the .patch
+    # file as a guide (line numbers may shift with Virtualmin updates)
+
+After a Virtualmin update, check if the patches are still present:
+
+    grep -n 'list_plugin_users' \
+        /usr/share/webmin/virtual-server/virtual-server-lib-funcs.pl
+    grep -n 'users_create_links' \
+        /usr/share/webmin/virtual-server/list_users.cgi
+    grep -n 'edit_url' \
+        /usr/share/webmin/virtual-server/virtual-server-lib-funcs.pl
+
+If any are missing, re-apply. The patches/ directory preserves the exact
+code needed.

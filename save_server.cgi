@@ -25,6 +25,7 @@ if ($in{'delete'}) {
 # Validate required fields
 $in{'host'} =~ /\S/ || &error($text{'save_ehost'});
 $in{'webmin_host'} =~ /\S/ || &error($text{'save_ewebmin_host'});
+$in{'webmin_user'} =~ /\S/ || &error($text{'save_ewebmin_user'});
 
 # Generate ID for new servers
 if ($is_new) {
@@ -45,9 +46,9 @@ my %server = (
 	webmin_port         => $in{'webmin_port'} || 10000,
 	webmin_ssl          => $in{'webmin_ssl'} || 0,
 	webmin_user         => $in{'webmin_user'} || 'root',
-	ssh_host            => $in{'ssh_host'} || $in{'host'},
-	ssh_user            => $in{'ssh_user'} || 'root',
-	ssh_key             => $in{'ssh_key'},
+	ssh_host            => $in{'ssh_host'} || '',
+	ssh_user            => $in{'ssh_user'} || '',
+	ssh_key             => $in{'ssh_key'} || '',
 	spam_gateway        => $in{'spam_gateway'},
 	spam_gateway_host   => $in{'spam_gateway_host'} || 'mg',
 	outgoing_relay      => $in{'outgoing_relay'},
@@ -57,13 +58,16 @@ my %server = (
 	default             => $in{'default'} || 0,
 );
 
-# Password: keep existing if not provided
+# Password: keep existing if not provided; require on new servers
 if ($in{'webmin_pass'}) {
 	$server{'webmin_pass'} = $in{'webmin_pass'};
 	}
 elsif (!$is_new) {
 	my $existing = &get_remote_mail_server($id);
 	$server{'webmin_pass'} = $existing->{'webmin_pass'} if ($existing);
+	}
+if (!$server{'webmin_pass'}) {
+	&error($text{'save_ewebmin_pass'});
 	}
 
 # If marking as default, unmark all others
