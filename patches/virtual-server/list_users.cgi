@@ -1,4 +1,4 @@
-#!/usr/bin/perl
+#!/usr/local/bin/perl
 # list_users.cgi
 # List mailbox users in some domain
 

@@ -2,8 +2,12 @@ Virtualmin Core Patches for Remote Mail Plugin Integration
 ==========================================================
 
 These patches modify Virtualmin's virtual-server module to support plugin-
-provided users in the main users listing. They are designed for upstream
-submission as a pull request to the Virtualmin project.
+provided users in the main users listing.
+
+Upstream PR: https://github.com/virtualmin/virtualmin-gpl/pull/1183
+
+Once merged, these patches will no longer need to be applied manually after
+Virtualmin updates.
 
 All patches gracefully degrade — if no plugins define the hooks, the code
 is a no-op and behavior is identical to stock Virtualmin.
