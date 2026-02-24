@@ -335,21 +335,26 @@ subtest 'validate_mail_username — valid inputs' => sub {
 };
 
 subtest 'validate_mail_username — invalid inputs' => sub {
-    plan tests => 7;
+    plan tests => 8;
 
     like(validate_mail_username(''), qr/required/i, 'Empty username rejected');
-    like(validate_mail_username('user@domain'), qr/invalid/i,
-         'Username with @ rejected');
+    # Delegates to virtual_server::valid_mailbox_name(), which uses
+    # valid_alias_name() to reject shell metacharacters and then
+    # rejects digit-leading names.
     like(validate_mail_username('user name'), qr/invalid/i,
          'Username with space rejected');
-    like(validate_mail_username('.leading'), qr/invalid/i,
-         'Leading dot rejected');
-    like(validate_mail_username('trailing.'), qr/invalid/i,
-         'Trailing dot rejected');
-    like(validate_mail_username('user..double'), qr/invalid/i,
-         'Consecutive dots rejected');
     like(validate_mail_username("user; rm -rf /"), qr/invalid/i,
-         'Shell injection rejected');
+         'Shell injection (semicolon) rejected');
+    like(validate_mail_username('user|pipe'), qr/invalid/i,
+         'Pipe character rejected');
+    like(validate_mail_username('user&bg'), qr/invalid/i,
+         'Ampersand rejected');
+    like(validate_mail_username('user/path'), qr/invalid/i,
+         'Slash rejected (path traversal)');
+    like(validate_mail_username('user\\back'), qr/invalid/i,
+         'Backslash rejected');
+    like(validate_mail_username('123numeric'), qr/number/i,
+         'Digit-leading username rejected');
 };
 
 # =========================================

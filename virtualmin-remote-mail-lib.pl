@@ -661,6 +661,9 @@ return undef;
 
 # validate_mail_username($username)
 # Validates a mail username (the local part before @domain).
+# Delegates to Virtualmin's standard valid_mailbox_name() which checks for
+# shell metacharacters (valid_alias_name), reserved names, numeric prefixes,
+# and system username restrictions (useradmin::check_username_restrictions).
 # Returns undef on success, or an error message string on failure.
 sub validate_mail_username
 {
@@ -668,13 +671,7 @@ my ($username) = @_;
 if (!defined($username) || $username eq '') {
 	return "Username is required";
 	}
-# Allow: letters, digits, dots, hyphens, underscores
-# Disallow: leading/trailing dots, consecutive dots, any other chars
-if ($username !~ /^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$/ ||
-    $username =~ /\.\./) {
-	return "Invalid username: only letters, numbers, dots, hyphens, and underscores are allowed";
-	}
-return undef;
+return &virtual_server::valid_mailbox_name($username);
 }
 
 # ---- Effective Mail Config (domain overrides + server defaults) ----

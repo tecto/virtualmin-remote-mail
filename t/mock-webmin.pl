@@ -535,6 +535,29 @@ sub domain_footer_link {
     return "";
 }
 
+# Username validation — mirrors the real Virtualmin validation chain:
+#   valid_mailbox_name → valid_alias_name → check_username_restrictions
+sub valid_alias_name {
+    my ($name) = @_;
+    if ($name !~ /^[^ \t:\&\(\)\|\;\<\>\*\?\!\/\\]+$/) {
+        return "The username contains invalid characters";
+        }
+    return undef;
+}
+
+sub valid_mailbox_name {
+    my ($name) = @_;
+    my $err = valid_alias_name($name);
+    return $err if ($err);
+    if ($name eq "domains") {
+        return "The username '$name' is reserved";
+        }
+    if ($name =~ /^\d+/) {
+        return "Usernames starting with a number are not allowed";
+        }
+    return undef;
+}
+
 package main;
 
 # Track progress messages for test assertions
