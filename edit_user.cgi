@@ -26,6 +26,8 @@ my $local_user = $in{'user'} || '';
 $local_user =~ s/\@.*$// if ($local_user =~ /\@/);
 
 if ($editing) {
+	my $uerr = &validate_mail_username($local_user);
+	&error($uerr) if ($uerr);
 	$user_data = &get_remote_mail_user($d, $server_id, $local_user);
 	$user_data || &error($text{'user_enotfound'});
 	}

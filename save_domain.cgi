@@ -137,6 +137,10 @@ elsif ($in{'action'} eq 'create_user') {
 			my @new_fwd = split(/[\r\n]+/, $fwd_text);
 			s/^\s+|\s+$//g for @new_fwd;
 			@new_fwd = grep { $_ ne '' } @new_fwd;
+			foreach my $faddr (@new_fwd) {
+				my $ferr = &validate_email_address($faddr);
+				&error($ferr) if ($ferr);
+				}
 			$changes{'add_forward'} = \@new_fwd if (@new_fwd);
 			}
 
@@ -178,7 +182,9 @@ elsif ($in{'action'} eq 'save_user') {
 	$server || &error($text{'setup_enoserver'});
 
 	my $old_user = $in{'old_user'};
-	&error($text{'user_eusername'}) if (!$old_user || $old_user !~ /\S/);
+	$old_user =~ s/^\s+|\s+$//g if defined($old_user);
+	my $uerr = &validate_mail_username($old_user);
+	&error($uerr) if ($uerr);
 
 	# Handle delete button
 	if ($in{'delete'}) {
@@ -225,7 +231,11 @@ elsif ($in{'action'} eq 'save_user') {
 		else {
 			my $recovery = $in{'recovery'} || '';
 			$recovery =~ s/^\s+|\s+$//g;
-			$changes{'recovery'} = $recovery if ($recovery ne '');
+			if ($recovery ne '') {
+				my $rerr = &validate_email_address($recovery);
+				&error($rerr) if ($rerr);
+				$changes{'recovery'} = $recovery;
+				}
 			}
 
 		# Real name
@@ -256,6 +266,10 @@ elsif ($in{'action'} eq 'save_user') {
 			@new_fwd = split(/[\r\n]+/, $fwd_text);
 			s/^\s+|\s+$//g for @new_fwd;
 			@new_fwd = grep { $_ ne '' } @new_fwd;
+			foreach my $faddr (@new_fwd) {
+				my $ferr = &validate_email_address($faddr);
+				&error($ferr) if ($ferr);
+				}
 			}
 		my %old_set = map { $_ => 1 } @old_fwd;
 		my %new_set = map { $_ => 1 } @new_fwd;
@@ -312,7 +326,8 @@ elsif ($in{'action'} eq 'delete_user') {
 
 	my $username = $in{'username'};
 	$username =~ s/^\s+|\s+$//g if defined($username);
-	&error($text{'user_eusername'}) if (!$username || $username !~ /\S/);
+	my $uerr = &validate_mail_username($username);
+	&error($uerr) if ($uerr);
 
 	&ui_print_unbuffered_header(&virtual_server::domain_in($d),
 	                            $text{'domain_title'}, "");

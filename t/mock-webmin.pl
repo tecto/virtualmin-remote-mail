@@ -142,6 +142,10 @@ sub ReadParse {
     if ($ENV{'QUERY_STRING'}) {
         foreach my $pair (split(/&/, $ENV{'QUERY_STRING'})) {
             my ($k, $v) = split(/=/, $pair, 2);
+            $v = '' if !defined($v);
+            $v =~ s/\+/ /g;
+            $v =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/ge;
+            $k =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/ge;
             $params{$k} = $v;
             }
         }
@@ -215,6 +219,44 @@ sub ui_radio {
 sub ui_opt_textbox {
     my ($name, $value, $size, $opt_label) = @_;
     return &ui_textbox($name, $value, $size);
+}
+
+sub ui_hidden_table_start {
+    my ($title, $width, $cols, $id, $open) = @_;
+    return "<table id='$id'><tr><th colspan='$cols'>$title</th></tr>\n";
+}
+
+sub ui_hidden_table_end {
+    my ($id) = @_;
+    return "</table>\n";
+}
+
+sub ui_textarea {
+    my ($name, $value, $rows, $cols) = @_;
+    return "<textarea name='$name' rows='$rows' cols='$cols'>$value</textarea>\n";
+}
+
+sub ui_checkbox {
+    my ($name, $value, $label, $checked) = @_;
+    my $chk = $checked ? " checked" : "";
+    return "<input type='checkbox' name='$name' value='$value'$chk> $label";
+}
+
+sub ui_hr {
+    return "<hr>\n";
+}
+
+sub ui_buttons_start {
+    return "<div class='buttons'>\n";
+}
+
+sub ui_buttons_end {
+    return "</div>\n";
+}
+
+sub ui_buttons_row {
+    my ($script, $label, $desc) = @_;
+    return "<button>$label</button> $desc\n";
 }
 
 sub ui_password {
@@ -431,10 +473,29 @@ our %text = ( 'setup_done' => '.. done' );
 
 our @_progress_messages;
 
+# Domain registry: keyed by domain name, values are domain hash refs
+our %_mock_domains;
+sub mock_add_domain {
+    my ($dom_name, $dom_hash) = @_;
+    $_mock_domains{$dom_name} = $dom_hash;
+}
+sub mock_clear_domains {
+    %_mock_domains = ();
+}
+
+# Domain save capture
+our @_saved_domains;
+
 sub get_template { return { 'default' => 1 }; }
 sub domain_in { return $_[0]->{'dom'}; }
-sub get_domain_by { return undef; }
-sub list_domains { return (); }
+
+sub get_domain_by {
+    my ($type, $value) = @_;
+    return $_mock_domains{$value} if ($type eq 'dom' && exists $_mock_domains{$value});
+    return undef;
+}
+
+sub list_domains { return values %_mock_domains; }
 sub can_edit_domain { return 1; }
 
 sub obtain_lock_dns { }
@@ -465,7 +526,13 @@ sub delete_dns_record {
 }
 
 sub save_domain {
-    # No-op for testing
+    my ($d) = @_;
+    push(@_saved_domains, { %{$d} }) if ($d);
+}
+
+sub domain_footer_link {
+    my ($d) = @_;
+    return "";
 }
 
 package main;
@@ -515,6 +582,36 @@ sub load_plugin_feature {
 
     eval $code;
     die "Failed to load $feat_path: $@" if $@;
+}
+
+# Helper to run a CGI handler with specific %in params.
+# Sets %main::in, evals the handler file, captures output and errors.
+# Returns ($output, $error).
+sub run_cgi_handler {
+    my ($file, %params) = @_;
+    %main::in = %params;
+    my $output = '';
+    open(my $fh, '>', \$output);
+    my $old = select($fh);
+    my $err;
+    eval {
+        # Load handler code, skipping the require/ReadParse lines
+        open(my $cfh, '<', $file) or die "Cannot open $file: $!";
+        my $code = '';
+        while (<$cfh>) {
+            next if /^#!.*perl/;
+            next if /^require\s+'virtualmin-remote-mail-lib\.pl'/;
+            next if /^&ReadParse/;
+            $code .= $_;
+            }
+        close($cfh);
+        eval $code;
+        die $@ if $@;
+        };
+    $err = $@;
+    select($old);
+    close($fh);
+    return ($output, $err);
 }
 
 1;

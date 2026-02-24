@@ -222,6 +222,7 @@ my ($server_id, $subcmd, @args) = @_;
 my @parts = ("virtualmin", $subcmd);
 for (my $i = 0; $i < @args; $i++) {
 	if ($args[$i] =~ /^--/) {
+		die "Invalid flag: $args[$i]" if ($args[$i] !~ /^--[a-z0-9-]+$/);
 		push(@parts, $args[$i]);
 		# If next arg is a value (doesn't start with --), quote it
 		if ($i + 1 < @args && $args[$i + 1] !~ /^--/) {
@@ -548,6 +549,8 @@ return @records;
 sub get_domain_state
 {
 my ($domain) = @_;
+my $derr = &validate_domain_name($domain);
+return {} if ($derr);
 my $file = "$domains_dir/${domain}.conf";
 my %state;
 if (-r $file) {
@@ -561,6 +564,8 @@ return \%state;
 sub save_domain_state
 {
 my ($domain, $state) = @_;
+my $derr = &validate_domain_name($domain);
+die $derr if ($derr);
 if (! -d $domains_dir) {
 	&make_dir($domains_dir, 0700);
 	}
@@ -575,6 +580,8 @@ my $file = "$domains_dir/${domain}.conf";
 sub delete_domain_state
 {
 my ($domain) = @_;
+my $derr = &validate_domain_name($domain);
+return if ($derr);
 my $file = "$domains_dir/${domain}.conf";
 &unlink_file($file) if (-f $file);
 }
@@ -619,6 +626,34 @@ elsif ($key eq 'outgoing_relay_port') {
 		return "Invalid port number: $value (must be 1-65535)";
 		}
 	}
+return undef;
+}
+
+# ---- Domain Name Validation ----
+
+# validate_domain_name($domain)
+# Validates a domain name for use in file paths and config.
+# Returns undef on success, or an error message string on failure.
+sub validate_domain_name
+{
+my ($domain) = @_;
+return "Domain name is required" if (!$domain || $domain !~ /\S/);
+return "Invalid domain name" if ($domain !~ /^[a-zA-Z0-9]([a-zA-Z0-9.\-]*[a-zA-Z0-9])?$/);
+return "Invalid domain name" if ($domain =~ /\.\./);
+return undef;
+}
+
+# ---- Email Address Validation ----
+
+# validate_email_address($email)
+# Validates an email address format.
+# Returns undef on success, or an error message string on failure.
+sub validate_email_address
+{
+my ($email) = @_;
+return "Email address is required" if (!$email || $email !~ /\S/);
+return "Invalid email address: $email"
+	if ($email !~ /^[a-zA-Z0-9._%+\-]+\@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$/);
 return undef;
 }
 

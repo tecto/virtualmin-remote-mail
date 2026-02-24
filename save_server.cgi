@@ -16,10 +16,16 @@ my $is_new = $in{'new'};
 # Handle delete
 if ($in{'delete'}) {
 	$id || &error($text{'delete_err'});
+	&error("Invalid server ID") if ($id !~ /^[a-zA-Z0-9]+$/);
 	&delete_remote_mail_server($id);
 	&webmin_log("delete", "server", $id);
 	&redirect("edit.cgi");
 	return;
+	}
+
+# Validate server ID for existing servers
+if (!$is_new) {
+	&error("Invalid server ID") if ($id !~ /^[a-zA-Z0-9]+$/);
 	}
 
 # Validate required fields
@@ -57,6 +63,14 @@ my %server = (
 	maildir_format      => $in{'maildir_format'} || '.maildir',
 	default             => $in{'default'} || 0,
 );
+
+# Validate mail routing fields
+foreach my $key (qw(spam_gateway spam_gateway_host outgoing_relay outgoing_relay_port)) {
+	if ($server{$key} && $server{$key} =~ /\S/) {
+		my $err = &validate_mail_override($key, $server{$key});
+		&error($err) if ($err);
+		}
+	}
 
 # Password: keep existing if not provided; require on new servers
 if ($in{'webmin_pass'}) {
