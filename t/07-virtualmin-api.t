@@ -251,7 +251,7 @@ subtest 'remote_virtualmin_cmd — error response' => sub {
 # =========================================
 
 subtest 'create_remote_mail_user — constructs create-user command' => sub {
-    plan tests => 4;
+    plan tests => 5;
 
     @main::_rpc_calls = ();
 
@@ -264,6 +264,8 @@ subtest 'create_remote_mail_user — constructs create-user command' => sub {
     like($cmds, qr/virtualmin create-user/, 'Uses virtualmin create-user');
     like($cmds, qr/--user\s+'info'/, 'Username passed');
     like($cmds, qr/--real\s+'Info Account'/, 'Real name passed');
+    # create-user has no --check-spam flag; spam check is on by default
+    unlike($cmds, qr/--check-spam/, 'No --check-spam flag (default is on)');
 };
 
 subtest 'create_remote_mail_user — error propagation' => sub {
@@ -401,22 +403,25 @@ subtest 'modify_remote_mail_user — clear autoreply and recovery' => sub {
 # Test: list_remote_mail_users — parsed output
 # =========================================
 
-subtest 'list_remote_mail_users — parses multiline output' => sub {
-    plan tests => 5;
+subtest 'list_remote_mail_users — parses realistic multiline output' => sub {
+    plan tests => 8;
 
     %main::_mock_cmd_responses = (
         'virtualmin list-users.*--domain.*example\.com' => {
-            output => "info\n    Real name: Info Account\n    Email address: info\@example.com\nadmin\n    Real name: Admin User\n    Email address: admin\@example.com",
+            output => "info\@example.com\n    User: info\n    Real name: Info Account\n    Email address: info\@example.com\n    Disabled: No\n    Check spam and viruses: Yes\n    Mail location: /home/example.com/homes/info/.maildir\nadmin\@example.com\n    User: admin\n    Real name: Admin User\n    Email address: admin\@example.com\n    Disabled: No\n    Check spam and viruses: Yes",
             exit   => 0,
         },
     );
 
     my @users = list_remote_mail_users($d, '1');
     is(scalar @users, 2, 'Two users returned');
-    is($users[0]->{'_name'}, 'info', 'First user name');
+    is($users[0]->{'_name'}, 'info@example.com', 'First user _name is full email');
+    is($users[0]->{'user'}, 'info', 'First user local part');
     is($users[0]->{'real_name'}, 'Info Account', 'First user real name');
-    is($users[1]->{'_name'}, 'admin', 'Second user name');
-    is($users[1]->{'email_address'}, 'admin@example.com', 'Second user email');
+    is($users[0]->{'disabled'}, 'No', 'First user disabled field');
+    is($users[0]->{'check_spam_and_viruses'}, 'Yes', 'First user spam field');
+    is($users[1]->{'_name'}, 'admin@example.com', 'Second user _name is full email');
+    is($users[1]->{'user'}, 'admin', 'Second user local part');
 
     %main::_mock_cmd_responses = ();
 };
@@ -442,21 +447,24 @@ subtest 'list_remote_mail_users — empty domain' => sub {
 # Test: get_remote_mail_user — single user lookup
 # =========================================
 
-subtest 'get_remote_mail_user — returns single user hash' => sub {
-    plan tests => 5;
+subtest 'get_remote_mail_user — returns single user with realistic fields' => sub {
+    plan tests => 8;
 
     %main::_mock_cmd_responses = (
         'virtualmin list-users.*--user.*info' => {
-            output => "info\n    Real name: Info Account\n    Email address: info\@example.com\n    Home directory: /home/example.com/homes/info\n    Forward to: info\@gmail.com",
+            output => "info\@example.com\n    User: info\n    Real name: Info Account\n    Email address: info\@example.com\n    Disabled: No\n    Check spam and viruses: Yes\n    Mail location: /home/example.com/homes/info/.maildir\n    Forward to: info\@gmail.com",
             exit   => 0,
         },
     );
 
     my $user = get_remote_mail_user($d, '1', 'info');
     ok($user, 'User returned');
-    is($user->{'_name'}, 'info', 'Username');
+    is($user->{'user'}, 'info', 'Local username');
     is($user->{'real_name'}, 'Info Account', 'Real name');
     is($user->{'email_address'}, 'info@example.com', 'Email');
+    is($user->{'disabled'}, 'No', 'Disabled field');
+    is($user->{'check_spam_and_viruses'}, 'Yes', 'Spam and viruses field');
+    is($user->{'mail_location'}, '/home/example.com/homes/info/.maildir', 'Mail location');
     is($user->{'forward_to'}, 'info@gmail.com', 'Forward');
 
     %main::_mock_cmd_responses = ();
@@ -579,6 +587,68 @@ subtest 'feature_enable — uses virtualmin enable-domain' => sub {
 
     my $cmds = captured_cmds();
     like($cmds, qr/virtualmin enable-domain/, 'Calls virtualmin enable-domain');
+};
+
+# =========================================
+# Test: get_remote_domain_info — domain feature lookup
+# =========================================
+
+subtest 'get_remote_domain_info — returns parsed domain info' => sub {
+    plan tests => 6;
+
+    %main::_mock_cmd_responses = (
+        'virtualmin list-domains.*--domain.*example\.com' => {
+            output => "example.com\n    Description: Example Domain\n    Username: example.com\n    Features: unix dir mail spam virus\n    Spam delivery: Mail file under home .maildir/.Junk/\n    Virus delivery: Throw away\n    Home directory: /home/example.com",
+            exit   => 0,
+        },
+    );
+
+    my $info = get_remote_domain_info($d, '1');
+    ok($info, 'Domain info returned');
+    is($info->{'_name'}, 'example.com', 'Domain name');
+    is($info->{'description'}, 'Example Domain', 'Description');
+    is($info->{'features'}, 'unix dir mail spam virus', 'Features string');
+    is($info->{'spam_delivery'}, 'Mail file under home .maildir/.Junk/', 'Spam delivery');
+    is($info->{'virus_delivery'}, 'Throw away', 'Virus delivery');
+
+    %main::_mock_cmd_responses = ();
+};
+
+subtest 'get_remote_domain_info — domain not found' => sub {
+    plan tests => 1;
+
+    %main::_mock_cmd_responses = (
+        'virtualmin list-domains.*--domain.*nonexistent\.com' => {
+            output => 'Virtual server nonexistent.com does not exist',
+            exit   => 1,
+        },
+    );
+
+    my $d_missing = { 'dom' => 'nonexistent.com' };
+    my $info = get_remote_domain_info($d_missing, '1');
+    ok(!$info, 'Returns undef for nonexistent domain');
+
+    %main::_mock_cmd_responses = ();
+};
+
+subtest 'get_remote_domain_info — feature parsing' => sub {
+    plan tests => 4;
+
+    %main::_mock_cmd_responses = (
+        'virtualmin list-domains.*--domain.*example\.com' => {
+            output => "example.com\n    Features: unix dir mail spam virus",
+            exit   => 0,
+        },
+    );
+
+    my $info = get_remote_domain_info($d, '1');
+    ok($info, 'Domain info returned');
+    my %feat = map { $_ => 1 } split(/\s+/, $info->{'features'} || '');
+    ok($feat{'mail'}, 'Mail feature present');
+    ok($feat{'spam'}, 'Spam feature present');
+    ok($feat{'virus'}, 'Virus feature present');
+
+    %main::_mock_cmd_responses = ();
 };
 
 # Clean up

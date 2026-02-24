@@ -267,6 +267,22 @@ push(@entries, $current) if ($current);
 return @entries;
 }
 
+# get_remote_domain_info(&domain, $server_id)
+# Returns a parsed hash of domain info from the remote server,
+# via `virtualmin list-domains --domain X --multiline`.
+sub get_remote_domain_info
+{
+my ($d, $server_id) = @_;
+my $dom = $d->{'dom'};
+
+my ($out, $exit) = &remote_virtualmin_cmd($server_id, "list-domains",
+	"--domain", $dom, "--multiline");
+return undef if ($exit || !$out);
+
+my @entries = &parse_multiline_output($out);
+return $entries[0];
+}
+
 # list_remote_mail_users(&domain, $server_id)
 # Returns a list of parsed user hashes for the domain from the remote
 # server, via `virtualmin list-users --domain X --multiline`.
@@ -307,6 +323,8 @@ my $dom = $d->{'dom'};
 my @args = ("--domain", $dom, "--user", $user);
 push(@args, "--pass", $password) if ($password);
 push(@args, "--real", $opts->{'real'}) if ($opts && $opts->{'real'});
+# Spam checking is enabled by default on create-user; only --no-check-spam
+# is a valid flag (there is no --check-spam for create-user).
 
 my ($out, $exit) = &remote_virtualmin_cmd($server_id, "create-user", @args);
 return $exit ? "Failed to create user: $out" : undef;
@@ -353,7 +371,14 @@ my @value_flags = (
 foreach my $pair (@value_flags) {
 	my ($key, $flag) = @$pair;
 	if (defined $changes->{$key}) {
-		push(@args, "--$flag", $changes->{$key});
+		if (ref($changes->{$key}) eq 'ARRAY') {
+			foreach my $val (@{$changes->{$key}}) {
+				push(@args, "--$flag", $val);
+				}
+			}
+		else {
+			push(@args, "--$flag", $changes->{$key});
+			}
 		}
 	}
 

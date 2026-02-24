@@ -50,6 +50,51 @@ if ($d->{'remote_mail_ssl_synced'}) {
 
 print &ui_table_end();
 
+# Remote mail features (fetched live from email1)
+if ($server_id && $state->{'domain_created'}) {
+	my $rdom = &get_remote_domain_info($d, $server_id);
+	if ($rdom) {
+		print &ui_table_start($text{'domain_remote_features'}, undef, 2);
+
+		my $features = $rdom->{'features'} || '';
+		my %feat = map { $_ => 1 } split(/\s+/, $features);
+
+		my @feat_rows = (
+			['mail',  $text{'domain_feat_mail'}],
+			['spam',  $text{'domain_feat_spam'}],
+			['virus', $text{'domain_feat_virus'}],
+		);
+		foreach my $f (@feat_rows) {
+			my ($key, $label) = @$f;
+			my $status = $feat{$key}
+				? "<font color=green>$text{'domain_feat_enabled'}</font>"
+				: "<font color=grey>$text{'domain_feat_disabled'}</font>";
+			print &ui_table_row($label, $status);
+			}
+
+		# Spam/virus delivery settings
+		if ($feat{'spam'} && $rdom->{'spam_delivery'}) {
+			my $spam_desc = $rdom->{'spam_delivery'};
+			# Translate Virtualmin's confusing "Mail file" wording
+			# "Mail file under home .maildir/.Junk/" → Maildir folder
+			if ($spam_desc =~ /\.maildir\/\.(\S+)/) {
+				$spam_desc = "Maildir folder ~/$1";
+				}
+			elsif ($spam_desc =~ /Mail file.*\/(\S+)/) {
+				$spam_desc = "Mail folder ~/$1";
+				}
+			print &ui_table_row($text{'domain_feat_spam_delivery'},
+				&html_escape($spam_desc));
+			}
+		if ($feat{'virus'} && $rdom->{'virus_delivery'}) {
+			print &ui_table_row($text{'domain_feat_virus_delivery'},
+				&html_escape($rdom->{'virus_delivery'}));
+			}
+
+		print &ui_table_end();
+		}
+	}
+
 # Mail routing overrides
 if ($server_id && $server) {
 	print &ui_form_start("save_domain.cgi", "post");
@@ -83,8 +128,8 @@ if ($server_id && $state->{'domain_created'}) {
 	print &ui_columns_start([ $text{'user_email'}, $text{'user_real'},
 	                          $text{'servers_actions'} ]);
 	foreach my $user (@users) {
-		my $uname = $user->{'_name'};
-		my $email = "${uname}\@".$d->{'dom'};
+		my $uname = $user->{'user'} || $user->{'_name'};
+		my $email = $user->{'_name'};
 		my $real = $user->{'real_name'} || '';
 		my $edit_link = "edit_user.cgi?dom=".&urlize($d->{'dom'}).
 		                "&user=".&urlize($uname);

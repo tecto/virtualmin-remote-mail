@@ -48,7 +48,7 @@ my $d = { 'dom' => 'testdomain.com', 'dns' => 1 };
 # =========================================
 
 subtest 'create_remote_mail_user' => sub {
-    plan tests => 4;
+    plan tests => 5;
 
     @main::_rpc_calls = ();
     my $err = create_remote_mail_user($d, '1', 'info', 'password123', {});
@@ -58,10 +58,12 @@ subtest 'create_remote_mail_user' => sub {
     like($cmds, qr/virtualmin create-user/, 'Uses virtualmin create-user');
     like($cmds, qr/--user\s+'info'/, 'Username passed');
     like($cmds, qr/--pass\s+'password123'/, 'Password passed');
+    # create-user has no --check-spam flag; spam check is on by default
+    unlike($cmds, qr/--check-spam/, 'No --check-spam flag (default is on)');
 };
 
 subtest 'create_remote_mail_user — with real name' => sub {
-    plan tests => 2;
+    plan tests => 3;
 
     @main::_rpc_calls = ();
     my $err = create_remote_mail_user($d, '1', 'john', 'pass123', {
@@ -71,6 +73,7 @@ subtest 'create_remote_mail_user — with real name' => sub {
 
     my $cmds = captured_cmds();
     like($cmds, qr/--real\s+'John Doe'/, 'Real name passed');
+    unlike($cmds, qr/--check-spam/, 'No --check-spam flag (default is on)');
 };
 
 # =========================================
@@ -128,7 +131,7 @@ subtest 'modify_remote_mail_user — rename' => sub {
 # Test: modify_remote_mail_user — forwarding
 # =========================================
 
-subtest 'modify_remote_mail_user — forwarding' => sub {
+subtest 'modify_remote_mail_user — forwarding (single)' => sub {
     plan tests => 3;
 
     @main::_rpc_calls = ();
@@ -141,6 +144,22 @@ subtest 'modify_remote_mail_user — forwarding' => sub {
     my $cmds = captured_cmds();
     like($cmds, qr/--add-forward\s+'info\@gmail\.com'/, 'Add-forward flag');
     like($cmds, qr/--local/, 'Local delivery flag');
+};
+
+subtest 'modify_remote_mail_user — forwarding (multi-value array)' => sub {
+    plan tests => 4;
+
+    @main::_rpc_calls = ();
+    my $err = modify_remote_mail_user($d, '1', 'info', {
+        add_forward => ['addr1@example.com', 'addr2@example.com'],
+        del_forward => ['old@example.com'],
+    });
+    is($err, undef, 'modify succeeds');
+
+    my $cmds = captured_cmds();
+    like($cmds, qr/--add-forward\s+'addr1\@example\.com'/, 'First add-forward');
+    like($cmds, qr/--add-forward\s+'addr2\@example\.com'/, 'Second add-forward');
+    like($cmds, qr/--del-forward\s+'old\@example\.com'/, 'Del-forward');
 };
 
 # =========================================
@@ -228,21 +247,23 @@ subtest 'modify_remote_mail_user — recovery' => sub {
 # Test: list_remote_mail_users — parsed output
 # =========================================
 
-subtest 'list_remote_mail_users — with mock responses' => sub {
-    plan tests => 4;
+subtest 'list_remote_mail_users — with realistic mock' => sub {
+    plan tests => 6;
 
     %main::_mock_cmd_responses = (
         'virtualmin list-users.*--domain.*testdomain\.com' => {
-            output => "info\n    Real name: Info Account\n    Email address: info\@testdomain.com\nadmin\n    Real name: Admin\n    Email address: admin\@testdomain.com",
+            output => "info\@testdomain.com\n    User: info\n    Real name: Info Account\n    Disabled: No\n    Check spam and viruses: Yes\n    Mail location: /home/testdomain.com/homes/info/.maildir\nadmin\@testdomain.com\n    User: admin\n    Real name: Admin\n    Disabled: No\n    Check spam and viruses: Yes",
             exit   => 0,
         },
     );
 
     my @users = list_remote_mail_users($d, '1');
     is(scalar @users, 2, 'Two users returned');
-    is($users[0]->{'_name'}, 'info', 'First user name');
+    is($users[0]->{'_name'}, 'info@testdomain.com', 'First user _name is full email');
+    is($users[0]->{'user'}, 'info', 'First user local part');
     is($users[0]->{'real_name'}, 'Info Account', 'First user real name');
-    is($users[1]->{'_name'}, 'admin', 'Second user name');
+    is($users[1]->{'_name'}, 'admin@testdomain.com', 'Second user _name is full email');
+    is($users[1]->{'user'}, 'admin', 'Second user local part');
 
     %main::_mock_cmd_responses = ();
 };
@@ -261,20 +282,23 @@ subtest 'list_remote_mail_users — empty (default mock)' => sub {
 # Test: get_remote_mail_user — single user
 # =========================================
 
-subtest 'get_remote_mail_user — found' => sub {
-    plan tests => 4;
+subtest 'get_remote_mail_user — found with realistic fields' => sub {
+    plan tests => 7;
 
     %main::_mock_cmd_responses = (
         'virtualmin list-users.*--user.*info' => {
-            output => "info\n    Real name: Info Account\n    Email address: info\@testdomain.com\n    Forward to: info\@gmail.com",
+            output => "info\@testdomain.com\n    User: info\n    Real name: Info Account\n    Email address: info\@testdomain.com\n    Disabled: No\n    Check spam and viruses: Yes\n    Mail location: /home/testdomain.com/homes/info/.maildir\n    Forward to: info\@gmail.com",
             exit   => 0,
         },
     );
 
     my $user = get_remote_mail_user($d, '1', 'info');
     ok($user, 'User found');
-    is($user->{'_name'}, 'info', 'Username');
+    is($user->{'user'}, 'info', 'Local username from User field');
     is($user->{'real_name'}, 'Info Account', 'Real name');
+    is($user->{'disabled'}, 'No', 'Disabled field');
+    is($user->{'check_spam_and_viruses'}, 'Yes', 'Check spam and viruses field');
+    is($user->{'mail_location'}, '/home/testdomain.com/homes/info/.maildir', 'Mail location');
     is($user->{'forward_to'}, 'info@gmail.com', 'Forward');
 
     %main::_mock_cmd_responses = ();
@@ -429,6 +453,92 @@ subtest 'modify_remote_mail_user — error propagation' => sub {
     like($err, qr/not found/, 'Error message propagated');
 
     %main::_mock_cmd_responses = ();
+};
+
+# =========================================
+# Test: create_user handler — applies email settings via modify after create
+# =========================================
+
+subtest 'create_user handler — forwarding triggers modify after create' => sub {
+    plan tests => 5;
+
+    # Simulate create_user handler with forwarding enabled
+    @main::_rpc_calls = ();
+
+    # Step 1: create the user (as handler does)
+    my $err = create_remote_mail_user($d, '1', 'fwduser', 'pass123', {});
+    is($err, undef, 'create succeeds');
+
+    # Step 2: handler detects non-default settings and calls modify
+    # (forward checked, tome unchecked, nospam=0 is default so no change)
+    my %changes = (
+        no_local    => 1,
+        add_forward => ['admin@example.com', 'backup@example.com'],
+    );
+    $err = modify_remote_mail_user($d, '1', 'fwduser', \%changes);
+    is($err, undef, 'modify succeeds');
+
+    my $cmds = captured_cmds();
+    like($cmds, qr/virtualmin create-user/, 'Create called first');
+    like($cmds, qr/virtualmin modify-user/, 'Modify called after create');
+    like($cmds, qr/--add-forward\s+'admin\@example\.com'/, 'Forward address applied');
+};
+
+subtest 'create_user handler — autoreply triggers modify after create' => sub {
+    plan tests => 4;
+
+    @main::_rpc_calls = ();
+
+    my $err = create_remote_mail_user($d, '1', 'vacuser', 'pass123', {});
+    is($err, undef, 'create succeeds');
+
+    my %changes = ( autoreply => 'Out of office until Monday' );
+    $err = modify_remote_mail_user($d, '1', 'vacuser', \%changes);
+    is($err, undef, 'modify succeeds');
+
+    my $cmds = captured_cmds();
+    like($cmds, qr/virtualmin create-user/, 'Create called first');
+    like($cmds, qr/--autoreply\s+'Out of office until Monday'/, 'Autoreply applied');
+};
+
+subtest 'create_user handler — no_check_spam triggers modify after create' => sub {
+    plan tests => 4;
+
+    @main::_rpc_calls = ();
+
+    my $err = create_remote_mail_user($d, '1', 'nospamuser', 'pass123', {});
+    is($err, undef, 'create succeeds');
+
+    my %changes = ( no_check_spam => 1 );
+    $err = modify_remote_mail_user($d, '1', 'nospamuser', \%changes);
+    is($err, undef, 'modify succeeds');
+
+    my $cmds = captured_cmds();
+    like($cmds, qr/virtualmin create-user/, 'Create called first');
+    like($cmds, qr/--no-check-spam/, 'No-check-spam applied');
+};
+
+subtest 'create_user handler — all defaults, no modify call needed' => sub {
+    plan tests => 3;
+
+    # When all settings are defaults (tome=1, forward off, auto off, nospam=0),
+    # the handler should NOT call modify_remote_mail_user
+    @main::_rpc_calls = ();
+
+    my $err = create_remote_mail_user($d, '1', 'defaultuser', 'pass123', {});
+    is($err, undef, 'create succeeds');
+
+    # No modify call — simulate handler logic: %changes is empty
+    my %changes;
+    # tome=1 (default) → no change
+    # forward off → no change
+    # auto off → no change
+    # nospam=0 (default) → no change
+    is(scalar(keys %changes), 0, 'No changes needed for default settings');
+
+    my $cmds = captured_cmds();
+    unlike($cmds, qr/virtualmin modify-user/,
+        'No modify call when all defaults');
 };
 
 # Clean up

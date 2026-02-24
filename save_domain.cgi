@@ -104,7 +104,7 @@ elsif ($in{'action'} eq 'create_user') {
 	my $verr = &validate_mail_username($username);
 	&error($verr) if ($verr);
 
-	my $password = $in{'password'};
+	my $password = $in{'mailpass'};
 	&error($text{'user_epassword'}) if (!$password || $password !~ /\S/);
 
 	my %opts;
@@ -122,6 +122,51 @@ elsif ($in{'action'} eq 'create_user') {
 		}
 	else {
 		&$virtual_server::second_print($virtual_server::text{'setup_done'});
+
+		# Apply email settings if non-default values were selected
+		my %changes;
+
+		# Local delivery: default is checked (tome=1); unchecked means no_local
+		if (!$in{'tome'}) {
+			$changes{'no_local'} = 1;
+			}
+
+		# Forwarding: default is unchecked; if checked, add forwards
+		if ($in{'forward'}) {
+			my $fwd_text = $in{'forwardto'} || '';
+			my @new_fwd = split(/[\r\n]+/, $fwd_text);
+			s/^\s+|\s+$//g for @new_fwd;
+			@new_fwd = grep { $_ ne '' } @new_fwd;
+			$changes{'add_forward'} = \@new_fwd if (@new_fwd);
+			}
+
+		# Auto-reply: default is unchecked; if checked, set autoreply
+		if ($in{'auto'}) {
+			my $msg = $in{'autotext'} || '';
+			$msg =~ s/\r//g;
+			$changes{'autoreply'} = $msg if ($msg ne '');
+			}
+
+		# Spam check: default is nospam=0 (Yes, check spam);
+		# nospam=1 means user chose No
+		if (defined($in{'nospam'}) && $in{'nospam'}) {
+			$changes{'no_check_spam'} = 1;
+			}
+
+		if (%changes) {
+			&$virtual_server::first_print(
+				&text('user_modifying', "${username}\@$in{'dom'}"));
+			my $merr = &modify_remote_mail_user(
+				$d, $server_id, $username, \%changes);
+			if ($merr) {
+				&$virtual_server::second_print(
+					"<font color=red>$merr</font>");
+				}
+			else {
+				&$virtual_server::second_print(
+					$virtual_server::text{'setup_done'});
+				}
+			}
 		}
 
 	&webmin_log("user_create", undef, "${username}\@$in{'dom'}");
@@ -157,19 +202,30 @@ elsif ($in{'action'} eq 'save_user') {
 		# Build changes hash from form inputs
 		my %changes;
 
-		# Username rename
-		my $new_user = $in{'username'};
-		$new_user =~ s/^\s+|\s+$//g if defined($new_user);
-		if ($new_user && $new_user ne $old_user) {
-			my $verr = &validate_mail_username($new_user);
-			&error($verr) if ($verr);
-			$changes{'newuser'} = $new_user;
+		# Fetch current user data for diffing forwarding addresses
+		my $user_data = &get_remote_mail_user($d, $server_id, $old_user);
+
+		# Password (radio: 1=leave unchanged, 0=set to)
+		if (!$in{'pass_mode'} && $in{'mailpass'} =~ /\S/) {
+			$changes{'pass'} = $in{'mailpass'};
 			}
 
-		# Password
-		my $password = $in{'password'};
-		if ($password && $password =~ /\S/) {
-			$changes{'pass'} = $password;
+		# Enable/disable (checkbox on password row)
+		if ($in{'disable'}) {
+			$changes{'disable'} = 1;
+			}
+		else {
+			$changes{'enable'} = 1;
+			}
+
+		# Recovery email (opt_textbox: None set vs Offsite address)
+		if ($in{'recovery_def'}) {
+			$changes{'no_recovery'} = 1;
+			}
+		else {
+			my $recovery = $in{'recovery'} || '';
+			$recovery =~ s/^\s+|\s+$//g;
+			$changes{'recovery'} = $recovery if ($recovery ne '');
 			}
 
 		# Real name
@@ -177,73 +233,65 @@ elsif ($in{'action'} eq 'save_user') {
 		$real =~ s/^\s+|\s+$//g if defined($real);
 		$changes{'real'} = $real if (defined $real);
 
-		# Forwarding
-		my $forward = $in{'forward'};
-		$forward =~ s/^\s+|\s+$//g if defined($forward);
-		if (defined($forward) && $forward ne '') {
-			$changes{'add_forward'} = $forward;
+		# Local delivery (tome checkbox)
+		if ($in{'tome'}) {
+			$changes{'local'} = 1;
+			}
+		else {
+			$changes{'no_local'} = 1;
 			}
 
-		# Local delivery
-		if (defined $in{'local'}) {
-			if ($in{'local'}) {
-				$changes{'local'} = 1;
-				}
-			else {
-				$changes{'no_local'} = 1;
-				}
+		# Forwarding (checkbox + textarea, diff with current)
+		my @old_fwd;
+		if ($user_data) {
+			my $fwd_raw = $user_data->{'forward_to'} || '';
+			@old_fwd = split(/[,\s]+/, $fwd_raw);
+			@old_fwd = grep { $_ ne '' } @old_fwd;
+			}
+		my @new_fwd;
+		if ($in{'forward'}) {
+			my $fwd_text = $in{'forwardto'} || '';
+			&error($text{'user_eforward'})
+				if ($fwd_text !~ /\S/);
+			@new_fwd = split(/[\r\n]+/, $fwd_text);
+			s/^\s+|\s+$//g for @new_fwd;
+			@new_fwd = grep { $_ ne '' } @new_fwd;
+			}
+		my %old_set = map { $_ => 1 } @old_fwd;
+		my %new_set = map { $_ => 1 } @new_fwd;
+		my @to_add = grep { !$old_set{$_} } @new_fwd;
+		my @to_del = grep { !$new_set{$_} } @old_fwd;
+		$changes{'add_forward'} = \@to_add if (@to_add);
+		$changes{'del_forward'} = \@to_del if (@to_del);
+
+		# Auto-reply (checkbox + textarea)
+		if ($in{'auto'}) {
+			my $msg = $in{'autotext'} || '';
+			$msg =~ s/\r//g;
+			$changes{'autoreply'} = $msg if ($msg ne '');
+			}
+		else {
+			$changes{'no_autoreply'} = 1;
 			}
 
-		# Auto-reply
-		if (defined $in{'autoreply_on'}) {
-			if ($in{'autoreply_on'}) {
-				my $msg = $in{'autoreply_msg'} || '';
-				$changes{'autoreply'} = $msg if ($msg ne '');
-				}
-			else {
-				$changes{'no_autoreply'} = 1;
-				}
-			}
-
-		# Spam filtering
-		if (defined $in{'check_spam'}) {
-			if ($in{'check_spam'}) {
-				$changes{'check_spam'} = 1;
-				}
-			else {
+		# Spam filtering (radio: 0=Yes check, 1=No don't check)
+		if (defined $in{'nospam'}) {
+			if ($in{'nospam'}) {
 				$changes{'no_check_spam'} = 1;
 				}
-			}
-
-		# Enable/disable
-		if (defined $in{'enabled'}) {
-			if ($in{'enabled'}) {
-				$changes{'enable'} = 1;
-				}
 			else {
-				$changes{'disable'} = 1;
+				$changes{'check_spam'} = 1;
 				}
 			}
 
-		# Recovery email
-		my $recovery = $in{'recovery'};
-		$recovery =~ s/^\s+|\s+$//g if defined($recovery);
-		if (defined($recovery) && $recovery ne '') {
-			$changes{'recovery'} = $recovery;
-			}
-		elsif (defined($recovery) && $recovery eq '') {
-			$changes{'no_recovery'} = 1;
-			}
-
-		# Send update email
-		if ($in{'send_update'}) {
+		# Send updated account email
+		if (defined($in{'remail_def'}) && !$in{'remail_def'}) {
 			$changes{'send_update_email'} = 1;
 			}
 
 		&ui_print_unbuffered_header(&virtual_server::domain_in($d),
 		                            $text{'domain_title'}, "");
 
-		my $display_user = $changes{'newuser'} || $old_user;
 		&$virtual_server::first_print(&text('user_modifying', "${old_user}\@$in{'dom'}"));
 		my $err = &modify_remote_mail_user($d, $server_id, $old_user, \%changes);
 		if ($err) {

@@ -1,6 +1,6 @@
 #!/usr/local/bin/perl
 # edit_user.cgi — Add or edit a remote mail user
-# Supports two modes:
+# Layout matches the standard Virtualmin user edit form.
 #   ?dom=X              — Create new user
 #   ?dom=X&user=Y       — Edit existing user (loads data from email1)
 use strict;
@@ -22,9 +22,11 @@ $server || &error($text{'setup_enoserver'});
 
 my $editing = $in{'user'} ? 1 : 0;
 my $user_data;
+my $local_user = $in{'user'} || '';
+$local_user =~ s/\@.*$// if ($local_user =~ /\@/);
 
 if ($editing) {
-	$user_data = &get_remote_mail_user($d, $server_id, $in{'user'});
+	$user_data = &get_remote_mail_user($d, $server_id, $local_user);
 	$user_data || &error($text{'user_enotfound'});
 	}
 
@@ -36,90 +38,147 @@ print &ui_hidden("dom", $d->{'dom'});
 
 if ($editing) {
 	print &ui_hidden("action", "save_user");
-	print &ui_hidden("old_user", $in{'user'});
+	print &ui_hidden("old_user", $local_user);
 	}
 else {
 	print &ui_hidden("action", "create_user");
 	}
 
-print &ui_table_start($text{'user_header'}, undef, 2);
+# ---- User details section ----
+print &ui_hidden_table_start($text{'user_header'}, "width=100%", 2,
+	"table1", 1);
 
-# Email domain (display only)
-print &ui_table_row($text{'user_email'},
-	"\@".$d->{'dom'});
-
-# Username
 if ($editing) {
-	print &ui_table_row($text{'user_username'},
-		&ui_textbox("username", $in{'user'}, 20));
-	}
-else {
-	print &ui_table_row($text{'user_username'},
-		&ui_textbox("username", '', 20));
-	}
+	# Login username (display only, full email)
+	print &ui_table_row($text{'user_login'},
+		"<tt>".&html_escape($local_user."\@".$d->{'dom'})."</tt>");
 
-# Password
-print &ui_table_row($text{'user_password'},
-	&ui_textbox("password", '', 20).
-	" <i>".$text{'user_password_hint'}."</i>");
+	# Email address (editable local part + fixed domain)
+	print &ui_table_row($text{'user_email'},
+		&ui_textbox("username", $local_user, 20).
+		"\@".$d->{'dom'});
 
-# Real name
-my $real = $editing && $user_data ? ($user_data->{'real_name'} || '') : '';
-print &ui_table_row($text{'user_real'},
-	&ui_textbox("real", $real, 30));
+	# Password: Leave unchanged / Set to .. + disabled checkbox
+	my $enabled = ($user_data->{'disabled'} || 'No') eq 'No' ? 1 : 0;
+	my $pwfield = &ui_radio("pass_mode", 1,
+		[ [ 1, $text{'user_pass_leave'}."<br>" ],
+		  [ 0, $text{'user_pass_set'}." ".
+		       &ui_password("mailpass", undef, 20, 0, undef,
+		                    "data-password") ] ]);
+	$pwfield .= "<br>".
+		&ui_checkbox("disable", 1, $text{'user_disabled'}, !$enabled);
+	print &ui_table_row($text{'user_password'}, $pwfield);
 
-print &ui_table_end();
-
-# Advanced settings (only when editing)
-if ($editing) {
-	print &ui_table_start($text{'user_advanced'}, undef, 2);
-
-	# Forwarding
-	my $fwd = $user_data->{'forward_to'} || '';
-	print &ui_table_row($text{'user_forward'},
-		&ui_textbox("forward", $fwd, 40).
-		" <i>".$text{'user_forward_hint'}."</i>");
-
-	# Local delivery (keep copy locally when forwarding)
-	my $local = ($user_data->{'local_delivery'} || '') eq 'Yes' ? 1 : 0;
-	print &ui_table_row($text{'user_local'},
-		&ui_yesno_radio("local", $local));
-
-	# Auto-reply
-	my $autoreply = $user_data->{'auto_reply'} || '';
-	my $has_autoreply = ($autoreply ne '' && $autoreply ne 'No') ? 1 : 0;
-	print &ui_table_row($text{'user_autoreply_enabled'},
-		&ui_yesno_radio("autoreply_on", $has_autoreply));
-	my $autoreply_msg = $has_autoreply ? $autoreply : '';
-	print &ui_table_row($text{'user_autoreply_msg'},
-		"<textarea name='autoreply_msg' rows='3' cols='50'>".
-		&html_escape($autoreply_msg)."</textarea>");
-
-	# Spam filtering
-	my $spam = ($user_data->{'check_spam'} || '') eq 'Yes' ? 1 : 0;
-	print &ui_table_row($text{'user_spam'},
-		&ui_yesno_radio("check_spam", $spam));
-
-	# Account enabled/disabled
-	my $enabled = ($user_data->{'enabled'} || 'Yes') eq 'Yes' ? 1 : 0;
-	print &ui_table_row($text{'user_enabled'},
-		&ui_yesno_radio("enabled", $enabled));
-
-	# Recovery email
+	# Password recovery address
 	my $recovery = $user_data->{'recovery_email'} || '';
 	print &ui_table_row($text{'user_recovery'},
-		&ui_textbox("recovery", $recovery, 30));
+		&ui_opt_textbox("recovery",
+			$recovery ne '' ? $recovery : undef, 40,
+			$text{'user_norecovery'},
+			$text{'user_gotrecovery'}));
 
-	# Send update email checkbox
-	print &ui_table_row($text{'user_send_update'},
-		"<input type='checkbox' name='send_update' value='1'> ".
-		$text{'user_send_update_desc'});
+	# Real name
+	my $real = $user_data->{'real_name'} || '';
+	print &ui_table_row($text{'user_real'},
+		&ui_textbox("real", $real, 30));
+	}
+else {
+	# New user: Email address (editable local part + fixed domain)
+	print &ui_table_row($text{'user_email'},
+		&ui_textbox("username", '', 20).
+		"\@".$d->{'dom'});
 
-	print &ui_table_end();
+	# Password (required)
+	print &ui_table_row($text{'user_password'},
+		&ui_password("mailpass", undef, 20, 0, undef,
+		             "data-password"));
+
+	# Real name
+	print &ui_table_row($text{'user_real'},
+		&ui_textbox("real", '', 30));
 	}
 
+print &ui_hidden_table_end("table1");
+
+# ---- Email settings section ----
+print &ui_hidden_table_start($text{'user_email_settings'},
+	"width=100%", 2, "table2a", $editing ? 0 : 1);
+
+if ($editing) {
+	# Deliver to this user normally (local delivery)
+	my $has_mail_location = $user_data->{'mail_location'} ? 1 : 0;
+	my $local = $has_mail_location ? 1 : 0;
+	print &ui_table_row($text{'user_tome'},
+		&ui_checkbox("tome", 1, $text{'user_tome_yes'}, $local));
+
+	# Forward to other addresses
+	my $fwd_raw = $user_data->{'forward_to'} || '';
+	my @fwd_addrs;
+	if ($fwd_raw ne '') {
+		@fwd_addrs = split(/[,\s]+/, $fwd_raw);
+		@fwd_addrs = grep { $_ ne '' } @fwd_addrs;
+		}
+	my $has_forwards = scalar(@fwd_addrs) ? 1 : 0;
+	print &ui_table_row($text{'user_forward'},
+		&ui_checkbox("forward", 1, $text{'user_forward_yes'},
+			$has_forwards)."<br>\n".
+		&ui_textarea("forwardto", join("\n", @fwd_addrs), 3, 40));
+
+	# Send automatic reply
+	my $autoreply_raw = $user_data->{'auto_reply'} || '';
+	my $has_autoreply = ($autoreply_raw ne '' &&
+		$autoreply_raw ne 'No') ? 1 : 0;
+	my $autoreply_msg = $has_autoreply ? $autoreply_raw : '';
+	print &ui_table_row($text{'user_auto'},
+		&ui_checkbox("auto", 1, $text{'user_auto_yes'},
+			$has_autoreply)."<br>\n".
+		&ui_textarea("autotext", $autoreply_msg, 5, 60));
+
+	# Check email for spam and viruses?
+	my $nospam = ($user_data->{'check_spam_and_viruses'} || '') eq 'Yes' ? 0 : 1;
+	print &ui_table_row($text{'user_nospam'},
+		&ui_radio("nospam", $nospam,
+			[ [ 0, $text{'yes'} ],
+			  [ 1, $text{'no'} ] ]));
+
+	# Send updated account email to
+	print &ui_table_row($text{'user_remail'},
+		&ui_radio("remail_def", 1,
+			[ [ 1, $text{'user_remail_no'} ],
+			  [ 0, $text{'user_remail_yes'} ] ])." ".
+		&ui_textbox("remail",
+			$local_user."\@".$d->{'dom'}, 40));
+	}
+else {
+	# New user: sensible defaults
+	# Deliver to this user normally (local delivery) — checked by default
+	print &ui_table_row($text{'user_tome'},
+		&ui_checkbox("tome", 1, $text{'user_tome_yes'}, 1));
+
+	# Forward to other addresses — unchecked, empty
+	print &ui_table_row($text{'user_forward'},
+		&ui_checkbox("forward", 1, $text{'user_forward_yes'},
+			0)."<br>\n".
+		&ui_textarea("forwardto", '', 3, 40));
+
+	# Send automatic reply — unchecked, empty
+	print &ui_table_row($text{'user_auto'},
+		&ui_checkbox("auto", 1, $text{'user_auto_yes'},
+			0)."<br>\n".
+		&ui_textarea("autotext", '', 5, 60));
+
+	# Check email for spam and viruses? — Yes by default
+	print &ui_table_row($text{'user_nospam'},
+		&ui_radio("nospam", 0,
+			[ [ 0, $text{'yes'} ],
+			  [ 1, $text{'no'} ] ]));
+	}
+
+print &ui_hidden_table_end("table2a");
+
 # Submit buttons
-my @buttons = ( [ undef, $editing ? $text{'user_save'} : $text{'domain_add_user'} ] );
+my @buttons = ( [ undef, $editing ? $text{'user_save'}
+                                  : $text{'domain_add_user'} ] );
 if ($editing) {
 	push(@buttons, [ 'delete', $text{'user_delete'} ]);
 	}

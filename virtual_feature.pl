@@ -1068,10 +1068,11 @@ my @user_data = eval { &list_remote_mail_users($d, $server_id) };
 return () if ($@ || !@user_data);
 my @users;
 foreach my $u (@user_data) {
-	my $username = $u->{'_name'};
+	my $localpart = $u->{'user'} || $u->{'_name'};
+	my $email = $u->{'_name'};
 	push(@users, {
-		'user' => $username.'@'.$d->{'dom'},
-		'email' => $u->{'email_address'} || $username.'@'.$d->{'dom'},
+		'user' => $email,
+		'email' => $u->{'email_address'} || $email,
 		'real' => $u->{'real_name'} || $text{'feat_remote_user_type'},
 		'extra' => 1,
 		'type' => $module_name,
@@ -1084,7 +1085,7 @@ foreach my $u (@user_data) {
 		'nomailfile' => 1,
 		'edit_url' => "/$module_name/edit_user.cgi?dom=".
 			      &urlize($d->{'dom'}).
-			      "&user=".&urlize($username),
+			      "&user=".&urlize($localpart),
 		'dom' => $d,
 		});
 	}
