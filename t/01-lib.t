@@ -419,7 +419,7 @@ subtest '_build_rpc_server helper' => sub {
 # =========================================
 
 subtest 'remote_mail_write via RPC' => sub {
-    plan tests => 3;
+    plan tests => 4;
 
     save_remote_mail_server('rpc2', {
         host        => 'vh2.trinsik.io',
@@ -431,13 +431,22 @@ subtest 'remote_mail_write via RPC' => sub {
         default     => 1,
     });
 
+    # Create a temp local file (remote_mail_write now reads file contents)
+    my $tmpfile = "$main::module_config_directory/test-write.pem";
+    open(my $fh, '>', $tmpfile) or die;
+    print $fh "TEST CERT DATA\n";
+    close($fh);
+
     @main::_files_written = ();
-    my $ok = remote_mail_write('rpc2', '/tmp/local.pem', '/etc/ssl/remote.pem');
+    my $ok = remote_mail_write('rpc2', $tmpfile, '/etc/ssl/remote.pem');
     ok($ok, 'remote_mail_write returns success');
     is(scalar @main::_files_written, 1, 'One file write captured');
     is($main::_files_written[0]{'remote'}, '/etc/ssl/remote.pem',
        'Remote path captured correctly');
+    like($main::_files_written[0]{'data'}, qr/TEST CERT DATA/,
+       'File data sent inline via RPC');
 
+    unlink($tmpfile);
     delete_remote_mail_server('rpc2');
 };
 
@@ -645,11 +654,18 @@ subtest 'remote_mail_write — establishes session' => sub {
         default     => 1,
     });
 
+    # Create a temp local file (remote_mail_write now reads file contents)
+    my $tmpfile = "$main::module_config_directory/test-session.pem";
+    open(my $fh, '>', $tmpfile) or die;
+    print $fh "SESSION TEST\n";
+    close($fh);
+
     %main::_rpc_initialized = ();
     @main::_rpc_require_calls = ();
     @main::_files_written = ();
 
-    remote_mail_write('sess4', '/tmp/local.pem', '/etc/ssl/remote.pem');
+    remote_mail_write('sess4', $tmpfile, '/etc/ssl/remote.pem');
+    unlink($tmpfile);
 
     is(scalar @main::_rpc_require_calls, 1,
        'remote_mail_write establishes session via remote_foreign_require');

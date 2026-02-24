@@ -124,23 +124,31 @@ return { 'host' => $server->{'webmin_host'} || $server->{'host'},
          'pass' => $server->{'webmin_pass'} };
 }
 
-# _ensure_rpc_session($serv)
-# Ensures a Webmin RPC session is established for the given server hash.
-# Calls remote_foreign_require once per server to create a FIFO session
-# on the remote side. Subsequent remote_foreign_call requests will reuse it.
+# _ensure_rpc_session($serv, $module)
+# Ensures a Webmin RPC session is established for the given server hash
+# and that the specified module is loaded in the remote FIFO subprocess.
+# The initial require creates the session; subsequent requires for different
+# modules tell the subprocess to load them too.
 our %_rpc_initialized;
 sub _ensure_rpc_session
 {
-my ($serv) = @_;
+my ($serv, $module) = @_;
+$module ||= 'webmin';
 my $key = ($serv->{'host'} || '') . ':' . ($serv->{'port'} || 10000);
 if (!$_rpc_initialized{$key}) {
 	&remote_foreign_require($serv, 'webmin');
-	$_rpc_initialized{$key} = 1;
+	$_rpc_initialized{$key} = { 'webmin' => 1 };
+	}
+if ($module ne 'webmin' && !$_rpc_initialized{$key}{$module}) {
+	&remote_foreign_require($serv, $module);
+	$_rpc_initialized{$key}{$module} = 1;
 	}
 }
 
 # remote_mail_call($server_id, $module, $func, @args)
-# Wrapper around remote_foreign_call to the mail server's Webmin
+# Wrapper around remote_foreign_call to the mail server's Webmin.
+# Ensures the target module is loaded on the remote FIFO subprocess
+# before making the call.
 sub remote_mail_call
 {
 my ($server_id, $module, $func, @args) = @_;
@@ -148,7 +156,7 @@ my $server = &get_remote_mail_server($server_id);
 return undef if (!$server);
 
 my $serv = &_build_rpc_server($server);
-&_ensure_rpc_session($serv);
+&_ensure_rpc_session($serv, $module);
 return &remote_foreign_call($serv, $module, $func, @args);
 }
 
@@ -185,7 +193,8 @@ return ($out, $exit);
 
 # remote_mail_write($server_id, $local_file, $remote_file)
 # Transfers a file to the remote server via Webmin RPC.
-# Replaces SCP for file transfers.
+# Uses rpc.cgi's inline 'write' action rather than remote_write()'s
+# 'tcpwrite' action, which requires fastrpc.cgi and open TCP ports.
 sub remote_mail_write
 {
 my ($server_id, $local_file, $remote_file) = @_;
@@ -194,7 +203,17 @@ return 0 if (!$server);
 
 my $serv = &_build_rpc_server($server);
 &_ensure_rpc_session($serv);
-return &remote_write($serv, $local_file, $remote_file);
+
+# Read local file contents
+open(my $fh, '<', $local_file) or die "Cannot read $local_file: $!";
+my $data = do { local $/; <$fh> };
+close($fh);
+
+# Use rpc.cgi 'write' action (inline data) instead of remote_write()
+# which sends 'tcpwrite' requiring fastrpc.cgi and random TCP ports
+return &remote_rpc_call($serv, { 'action' => 'write',
+                                  'file' => $remote_file,
+                                  'data' => $data });
 }
 
 # ---- Virtualmin CLI API Wrappers ----

@@ -421,6 +421,18 @@ sub remote_write {
     return 1;
 }
 
+# RPC call (mock — used by remote_mail_write for inline 'write' action)
+sub remote_rpc_call {
+    my ($server, $args) = @_;
+    if (ref($args) eq 'HASH' && $args->{'action'} eq 'write') {
+        push(@_files_written, { server => $server,
+                                remote => $args->{'file'},
+                                data => $args->{'data'} });
+        return $args->{'file'};
+        }
+    return 1;
+}
+
 # Remote require (mock — captured for test assertions)
 our @_rpc_require_calls;
 sub remote_foreign_require {
