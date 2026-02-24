@@ -92,6 +92,8 @@ delete_edns=DNS removal failed: $1
 modify_domain=Updating remote mail configuration for renamed domain ..
 modify_overrides=Updating remote mail configuration for changed routing overrides ..
 modify_err=Modification failed: $1
+modify_ssl=Syncing updated SSL certificate to remote mail server ..
+modify_essl=SSL sync failed: $1
 
 disable_mail=Disabling remote mail for domain ..
 disable_err=Failed to disable: $1

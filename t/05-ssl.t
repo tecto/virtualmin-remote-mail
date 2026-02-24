@@ -55,7 +55,7 @@ subtest 'get_remote_dkim_public_key' => sub {
 # =========================================
 
 subtest 'sync_remote_mail_ssl' => sub {
-    plan tests => 5;
+    plan tests => 9;
 
     # Create temp cert files
     my $tmpdir = tempdir(CLEANUP => 1);
@@ -65,6 +65,9 @@ subtest 'sync_remote_mail_ssl' => sub {
     open($fh, '>', "$tmpdir/ssl.key") or die;
     print $fh "KEY DATA\n";
     close($fh);
+    open($fh, '>', "$tmpdir/ssl.ca") or die;
+    print $fh "CA DATA\n";
+    close($fh);
 
     @main::_rpc_calls = ();
     @main::_files_written = ();
@@ -72,18 +75,31 @@ subtest 'sync_remote_mail_ssl' => sub {
         'dom'       => 'testdomain.com',
         'ssl_cert'  => "$tmpdir/ssl.cert",
         'ssl_key'   => "$tmpdir/ssl.key",
+        'ssl_chain' => "$tmpdir/ssl.ca",
     };
     my $err = sync_remote_mail_ssl($d, '1');
     is($err, undef, 'sync_remote_mail_ssl succeeds');
 
+    # Verify temp directory created on remote
     my $cmds = captured_cmds();
-    like($cmds, qr/ssl.*mail|mkdir/, 'Creates remote SSL directory');
+    like($cmds, qr/mkdir -p \/tmp\/\.ssl-sync/, 'Creates temp directory on remote');
 
-    # Verify file transfers via remote_write
+    # Verify cert/key/ca files written to temp dir via remote_write
     ok(scalar @main::_files_written >= 2, 'At least 2 files written via RPC');
     my @remotes = map { $_->{'remote'} } @main::_files_written;
-    ok(grep(/fullchain\.pem/, @remotes), 'fullchain.pem transferred');
-    ok(grep(/privkey\.pem/, @remotes), 'privkey.pem transferred');
+    ok(grep(/\.ssl-sync.*cert\.pem/, @remotes), 'cert.pem transferred to temp dir');
+    ok(grep(/\.ssl-sync.*key\.pem/, @remotes), 'key.pem transferred to temp dir');
+    ok(grep(/\.ssl-sync.*ca\.pem/, @remotes), 'ca.pem transferred when chain provided');
+
+    # Verify install-cert called via virtualmin CLI
+    like($cmds, qr/virtualmin install-cert/, 'Calls virtualmin install-cert');
+
+    # Verify RPC calls to sync_dovecot_ssl_cert and sync_postfix_ssl_cert
+    my @vs_calls = grep { $_->{'module'} eq 'virtual-server' } @main::_rpc_calls;
+    ok((grep { $_->{'func'} eq 'sync_dovecot_ssl_cert' } @vs_calls),
+       'Calls sync_dovecot_ssl_cert on remote');
+    ok((grep { $_->{'func'} eq 'sync_postfix_ssl_cert' } @vs_calls),
+       'Calls sync_postfix_ssl_cert on remote');
 };
 
 # =========================================
@@ -100,6 +116,102 @@ subtest 'sync_remote_mail_ssl - missing cert' => sub {
     };
     my $err = sync_remote_mail_ssl($d, '1');
     like($err, qr/not found/, 'Reports error for missing certificate');
+};
+
+# =========================================
+# Test: feature_modify triggers SSL sync on cert change
+# =========================================
+
+subtest 'feature_modify - SSL cert change triggers sync' => sub {
+    plan tests => 4;
+
+    # Create temp cert files for old and new
+    my $tmpdir = tempdir(CLEANUP => 1);
+    for my $f (qw(old.cert old.key new.cert new.key)) {
+        open(my $fh, '>', "$tmpdir/$f") or die;
+        print $fh uc($f) . " DATA\n";
+        close($fh);
+    }
+
+    # Set up domain state so feature_modify can find the server
+    my %state = ( 'server_id' => '1', 'setup_time' => time(),
+                  'domain_created' => 1, 'dns_configured' => 1 );
+    save_domain_state('ssltest.com', \%state);
+
+    my $oldd = {
+        'dom'       => 'ssltest.com',
+        'dns'       => 1,
+        'ssl_cert'  => "$tmpdir/old.cert",
+        'ssl_key'   => "$tmpdir/old.key",
+        $main::module_name => 1,
+        'remote_mail_server' => '1',
+    };
+    my $d = {
+        'dom'       => 'ssltest.com',
+        'dns'       => 1,
+        'ssl_cert'  => "$tmpdir/new.cert",
+        'ssl_key'   => "$tmpdir/new.key",
+        $main::module_name => 1,
+        'remote_mail_server' => '1',
+    };
+
+    @main::_rpc_calls = ();
+    @main::_files_written = ();
+    @main::_progress_messages = ();
+
+    my $ok = feature_modify($d, $oldd);
+    is($ok, 1, 'feature_modify returns success');
+
+    # Verify SSL sync progress message was printed
+    my @msgs = map { $_->{'msg'} } @main::_progress_messages;
+    ok((grep { /SSL/ } @msgs), 'SSL sync progress message printed');
+
+    # Verify install-cert was called (via backquote_command)
+    my $cmds = captured_cmds();
+    like($cmds, qr/virtualmin install-cert/, 'feature_modify calls install-cert on cert change');
+
+    # Verify ssl_synced timestamp was set
+    ok($d->{'remote_mail_ssl_synced'}, 'ssl_synced timestamp set on domain');
+
+    delete_domain_state('ssltest.com');
+};
+
+subtest 'feature_modify - no SSL sync when cert unchanged' => sub {
+    plan tests => 2;
+
+    my $tmpdir = tempdir(CLEANUP => 1);
+    open(my $fh, '>', "$tmpdir/ssl.cert") or die;
+    print $fh "CERT DATA\n";
+    close($fh);
+    open($fh, '>', "$tmpdir/ssl.key") or die;
+    print $fh "KEY DATA\n";
+    close($fh);
+
+    my %state = ( 'server_id' => '1', 'setup_time' => time(),
+                  'domain_created' => 1, 'dns_configured' => 1 );
+    save_domain_state('nochange.com', \%state);
+
+    my $same_d = {
+        'dom'       => 'nochange.com',
+        'dns'       => 1,
+        'ssl_cert'  => "$tmpdir/ssl.cert",
+        'ssl_key'   => "$tmpdir/ssl.key",
+        $main::module_name => 1,
+        'remote_mail_server' => '1',
+    };
+
+    @main::_rpc_calls = ();
+    @main::_progress_messages = ();
+
+    my $ok = feature_modify($same_d, $same_d);
+    is($ok, 1, 'feature_modify returns success');
+
+    # No SSL-related RPC calls should have been made
+    my @vs_calls = grep { $_->{'module'} eq 'virtual-server' &&
+                          $_->{'func'} =~ /sync_.*_ssl_cert/ } @main::_rpc_calls;
+    is(scalar @vs_calls, 0, 'No SSL sync calls when cert unchanged');
+
+    delete_domain_state('nochange.com');
 };
 
 # =========================================

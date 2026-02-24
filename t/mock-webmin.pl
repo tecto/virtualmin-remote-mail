@@ -395,6 +395,20 @@ sub remote_foreign_call {
             }
         return ("ok\n", "\n", "__RC__=0\n");
         }
+    # Handle virtual-server module RPC calls (used by _sync_remote_service_ssl)
+    if ($module eq 'virtual-server') {
+        if ($func eq 'get_domain_by') {
+            my $dom = $args[1];
+            return { 'id' => 1, 'dom' => $dom,
+                     'ssl_cert' => "/home/${dom}/ssl/${dom}.crt",
+                     'ssl_key' => "/home/${dom}/ssl/${dom}.key",
+                     'ssl_combined' => "/home/${dom}/ssl.combined" };
+            }
+        if ($func eq 'sync_dovecot_ssl_cert' ||
+            $func eq 'sync_postfix_ssl_cert') {
+            return 1;
+            }
+        }
     return 1;
 }
 

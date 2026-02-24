@@ -284,8 +284,9 @@ return 1;
 }
 
 # feature_modify(&domain, &olddomain)
-# Called when a domain with this feature is modified (e.g., renamed)
-# or when domain settings change (including mail routing overrides).
+# Called when a domain with this feature is modified (e.g., renamed),
+# when domain settings change (including mail routing overrides), or when
+# SSL certificates are updated (install-cert, Let's Encrypt renewal).
 sub feature_modify
 {
 my ($d, $oldd) = @_;
@@ -301,6 +302,17 @@ foreach my $key (qw(spam_gateway spam_gateway_host outgoing_relay outgoing_relay
 		$overrides_changed = 1;
 		last;
 		}
+	}
+
+# Check if SSL certificate changed (triggered by install-cert,
+# generate-letsencrypt-cert, etc. which call feature_modify for all plugins)
+my $ssl_changed = 0;
+if ($d->{'ssl_cert'} && $oldd->{'ssl_cert'}) {
+	$ssl_changed = ($d->{'ssl_cert'} ne $oldd->{'ssl_cert'} ||
+	                $d->{'ssl_key'} ne $oldd->{'ssl_key'});
+	}
+elsif ($d->{'ssl_cert'} && !$oldd->{'ssl_cert'}) {
+	$ssl_changed = 1;
 	}
 
 if ($renamed || $overrides_changed) {
@@ -346,6 +358,23 @@ if ($renamed || $overrides_changed) {
 		}
 	&$virtual_server::second_print($virtual_server::text{'setup_done'});
 	}
+
+# Re-sync SSL to remote mail server when cert changes
+if ($ssl_changed) {
+	&$virtual_server::first_print($text{'modify_ssl'});
+	my $server_id = &get_domain_mail_server($d);
+	my $err = &sync_remote_mail_ssl($d, $server_id);
+	if ($err) {
+		&$virtual_server::second_print(
+			&text('modify_essl', $err));
+		}
+	else {
+		$d->{'remote_mail_ssl_synced'} = time();
+		&$virtual_server::second_print(
+			$virtual_server::text{'setup_done'});
+		}
+	}
+
 return 1;
 }
 
@@ -949,7 +978,9 @@ return $@ ? "$@" : undef;
 # ---- SSL Certificate Sync ----
 
 # sync_remote_mail_ssl(&domain, $server_id)
-# Syncs SSL certificates from vh1 to the remote mail server via Webmin RPC.
+# Syncs SSL certificates from vh1 to the remote mail server using Virtualmin's
+# install-cert CLI and sync_dovecot_ssl_cert / sync_postfix_ssl_cert functions.
+# This leverages the same mechanisms Virtualmin uses for locally-hosted domains.
 sub sync_remote_mail_ssl
 {
 my ($d, $server_id) = @_;
@@ -965,26 +996,74 @@ eval {
 	if (! -r $cert) {
 		die "SSL certificate not found at $cert";
 		}
+	if (! -r $key) {
+		die "SSL key not found at $key";
+		}
 
-	my $remote_dir = "/etc/ssl/mail/${dom}";
-
+	# Push cert files to a temp directory on the remote server
+	my $tmp = "/tmp/.ssl-sync-$$-" . time();
 	my ($out, $exit) = &remote_mail_cmd($server_id,
-		"mkdir -p ${remote_dir} && chmod 700 ${remote_dir}");
+		"mkdir -p ${tmp} && chmod 700 ${tmp}");
 	if ($exit != 0) {
-		die "Failed to create remote SSL directory: $out";
+		die "Failed to create temp directory: $out";
 		}
 
-	&remote_mail_write($server_id, $cert, "${remote_dir}/fullchain.pem");
-	&remote_mail_write($server_id, $key, "${remote_dir}/privkey.pem");
+	&remote_mail_write($server_id, $cert, "${tmp}/cert.pem");
+	&remote_mail_write($server_id, $key, "${tmp}/key.pem");
 
+	# Build install-cert args
+	my @args = ("--domain", $dom,
+		    "--cert", "${tmp}/cert.pem",
+		    "--key", "${tmp}/key.pem");
 	if ($ca && -r $ca) {
-		&remote_mail_write($server_id, $ca, "${remote_dir}/chain.pem");
+		&remote_mail_write($server_id, $ca, "${tmp}/ca.pem");
+		push(@args, "--ca", "${tmp}/ca.pem");
 		}
 
-	&remote_mail_cmd($server_id, "chmod 600 ${remote_dir}/*.pem");
+	# Use Virtualmin's install-cert to store certs in standard paths
+	# (/home/{dom}/ssl/, ssl.combined) and register with domain config
+	($out, $exit) = &remote_virtualmin_cmd($server_id,
+		"install-cert", @args);
+	if ($exit != 0) {
+		&remote_mail_cmd($server_id, "rm -rf ${tmp}");
+		die "install-cert failed: $out";
+		}
 
-	($out, $exit) = &remote_mail_cmd($server_id,
-		"systemctl reload dovecot 2>/dev/null; systemctl reload postfix 2>/dev/null");
+	# Apply cert to Dovecot and Postfix via Virtualmin API functions
+	my $sync_err = &_sync_remote_service_ssl($server_id, $dom);
+	if ($sync_err) {
+		&remote_mail_cmd($server_id, "rm -rf ${tmp}");
+		die $sync_err;
+		}
+
+	# Clean up temp files
+	&remote_mail_cmd($server_id, "rm -rf ${tmp}");
+	};
+
+return $@ ? "$@" : undef;
+}
+
+# _sync_remote_service_ssl($server_id, $domain_name)
+# Calls sync_dovecot_ssl_cert and sync_postfix_ssl_cert on the remote server
+# via Webmin RPC to update Dovecot SNI blocks and Postfix SNI map entries.
+# Returns undef on success, error string on failure.
+sub _sync_remote_service_ssl
+{
+my ($server_id, $dom) = @_;
+
+eval {
+	# Get the domain hash from the remote server's Virtualmin
+	my $d_remote = &remote_mail_call($server_id,
+		'virtual-server', 'get_domain_by', 'dom', $dom);
+	if (!$d_remote || !$d_remote->{'id'}) {
+		die "Domain $dom not found on remote server";
+		}
+
+	# Call Virtualmin's sync functions to update Dovecot and Postfix
+	&remote_mail_call($server_id,
+		'virtual-server', 'sync_dovecot_ssl_cert', $d_remote, 1);
+	&remote_mail_call($server_id,
+		'virtual-server', 'sync_postfix_ssl_cert', $d_remote, 1);
 	};
 
 return $@ ? "$@" : undef;
