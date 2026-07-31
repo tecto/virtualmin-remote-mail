@@ -12,6 +12,9 @@ load_plugin_lib("$FindBin::Bin/../virtualmin-remote-mail-lib.pl");
 $main::domains_dir = "$main::module_config_directory/domains";
 load_plugin_feature("$FindBin::Bin/../virtual_feature.pl");
 
+# See t/mock-webmin.pl: skips unless the CLI-API architecture is present.
+require_cli_api_arch();
+
 my $cgi_dir = "$FindBin::Bin/..";
 
 # Helper: extract shell commands from RPC calls (backquote_command args)

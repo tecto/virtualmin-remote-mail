@@ -1,4 +1,4 @@
-#!/usr/local/bin/perl
+#!/usr/bin/perl
 # edit.cgi — Main module page: shows overview and links to server management
 use strict;
 use warnings;

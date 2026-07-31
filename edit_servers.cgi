@@ -1,4 +1,4 @@
-#!/usr/local/bin/perl
+#!/usr/bin/perl
 # edit_servers.cgi — Add/edit a remote mail server, or test connectivity
 use strict;
 use warnings;
@@ -76,20 +76,19 @@ print &ui_table_row($text{'server_webmin_pass'},
 	&ui_password("webmin_pass", '', 20) .
 	($server->{'webmin_pass'} ? " <i>(set)</i>" : ""));
 
-print &ui_table_row("<b>$text{'server_ssh_header'}</b>", "");
-print &ui_table_row("", "<i>$text{'server_ssh_note'}</i>");
+print &ui_table_row("<b>SSH Settings</b>", "");
 
-# SSH host (deprecated — kept for reference)
+# SSH host
 print &ui_table_row($text{'server_ssh_host'},
-	&ui_textbox("ssh_host", $server->{'ssh_host'} || '', 40));
+	&ui_textbox("ssh_host", $server->{'ssh_host'} || $server->{'host'}, 40));
 
-# SSH user (deprecated)
+# SSH user
 print &ui_table_row($text{'server_ssh_user'},
-	&ui_textbox("ssh_user", $server->{'ssh_user'} || '', 20));
+	&ui_textbox("ssh_user", $server->{'ssh_user'} || 'root', 20));
 
-# SSH key (deprecated)
+# SSH key
 print &ui_table_row($text{'server_ssh_key'},
-	&ui_textbox("ssh_key", $server->{'ssh_key'} || '', 50));
+	&ui_textbox("ssh_key", $server->{'ssh_key'} || '/root/.ssh/id_rsa', 50));
 
 print &ui_table_row("<b>Mail Routing</b>", "");
 

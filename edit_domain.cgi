@@ -1,4 +1,4 @@
-#!/usr/local/bin/perl
+#!/usr/bin/perl
 # edit_domain.cgi — Per-domain remote mail configuration
 use strict;
 use warnings;
@@ -28,8 +28,9 @@ print &ui_table_row($text{'domain_server'},
 
 # Status for each component
 my @components = (
-	['domain_created',     $text{'domain_domain'}],
 	['dns_configured',     $text{'domain_dns'}],
+	['postfix_configured', $text{'domain_postfix'}],
+	['dovecot_configured', $text{'domain_dovecot'}],
 	['dkim_configured',    $text{'domain_dkim'}],
 	['ssl_synced',         $text{'domain_ssl'}],
 );
@@ -49,51 +50,6 @@ if ($d->{'remote_mail_ssl_synced'}) {
 	}
 
 print &ui_table_end();
-
-# Remote mail features (fetched live from email1)
-if ($server_id && $state->{'domain_created'}) {
-	my $rdom = &get_remote_domain_info($d, $server_id);
-	if ($rdom) {
-		print &ui_table_start($text{'domain_remote_features'}, undef, 2);
-
-		my $features = $rdom->{'features'} || '';
-		my %feat = map { $_ => 1 } split(/\s+/, $features);
-
-		my @feat_rows = (
-			['mail',  $text{'domain_feat_mail'}],
-			['spam',  $text{'domain_feat_spam'}],
-			['virus', $text{'domain_feat_virus'}],
-		);
-		foreach my $f (@feat_rows) {
-			my ($key, $label) = @$f;
-			my $status = $feat{$key}
-				? "<font color=green>$text{'domain_feat_enabled'}</font>"
-				: "<font color=grey>$text{'domain_feat_disabled'}</font>";
-			print &ui_table_row($label, $status);
-			}
-
-		# Spam/virus delivery settings
-		if ($feat{'spam'} && $rdom->{'spam_delivery'}) {
-			my $spam_desc = $rdom->{'spam_delivery'};
-			# Translate Virtualmin's confusing "Mail file" wording
-			# "Mail file under home .maildir/.Junk/" → Maildir folder
-			if ($spam_desc =~ /\.maildir\/\.(\S+)/) {
-				$spam_desc = "Maildir folder ~/$1";
-				}
-			elsif ($spam_desc =~ /Mail file.*\/(\S+)/) {
-				$spam_desc = "Mail folder ~/$1";
-				}
-			print &ui_table_row($text{'domain_feat_spam_delivery'},
-				&html_escape($spam_desc));
-			}
-		if ($feat{'virus'} && $rdom->{'virus_delivery'}) {
-			print &ui_table_row($text{'domain_feat_virus_delivery'},
-				&html_escape($rdom->{'virus_delivery'}));
-			}
-
-		print &ui_table_end();
-		}
-	}
 
 # Mail routing overrides
 if ($server_id && $server) {
@@ -120,34 +76,6 @@ if ($server_id && $server) {
 
 	print &ui_table_end();
 	print &ui_form_end([ [ undef, $text{'domain_save_overrides'} ] ]);
-	}
-
-# Mail users section
-if ($server_id && $state->{'domain_created'}) {
-	my @users = &list_remote_mail_users($d, $server_id);
-	print &ui_columns_start([ $text{'user_email'}, $text{'user_real'},
-	                          $text{'servers_actions'} ]);
-	foreach my $user (@users) {
-		my $uname = $user->{'user'} || $user->{'_name'};
-		my $email = $user->{'_name'};
-		my $real = $user->{'real_name'} || '';
-		my $edit_link = "edit_user.cgi?dom=".&urlize($d->{'dom'}).
-		                "&user=".&urlize($uname);
-		print &ui_columns_row([
-			&ui_link($edit_link, &html_escape($email)),
-			&html_escape($real),
-			&ui_link($edit_link, $text{'servers_edit'}),
-			]);
-		}
-	if (!@users) {
-		print &ui_columns_row([ "<i>$text{'domain_no_users'}</i>", "", "" ]);
-		}
-	print &ui_columns_end();
-
-	# Add user link
-	print &ui_link("edit_user.cgi?dom=".&urlize($d->{'dom'}),
-		$text{'domain_add_user'});
-	print "<br>\n";
 	}
 
 # SSL sync button

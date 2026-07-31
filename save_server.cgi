@@ -1,4 +1,4 @@
-#!/usr/local/bin/perl
+#!/usr/bin/perl
 # save_server.cgi — Save or delete a remote mail server configuration
 use strict;
 use warnings;
@@ -16,22 +16,15 @@ my $is_new = $in{'new'};
 # Handle delete
 if ($in{'delete'}) {
 	$id || &error($text{'delete_err'});
-	&error("Invalid server ID") if ($id !~ /^[a-zA-Z0-9]+$/);
 	&delete_remote_mail_server($id);
 	&webmin_log("delete", "server", $id);
 	&redirect("edit.cgi");
 	return;
 	}
 
-# Validate server ID for existing servers
-if (!$is_new) {
-	&error("Invalid server ID") if ($id !~ /^[a-zA-Z0-9]+$/);
-	}
-
 # Validate required fields
 $in{'host'} =~ /\S/ || &error($text{'save_ehost'});
 $in{'webmin_host'} =~ /\S/ || &error($text{'save_ewebmin_host'});
-$in{'webmin_user'} =~ /\S/ || &error($text{'save_ewebmin_user'});
 
 # Generate ID for new servers
 if ($is_new) {
@@ -52,9 +45,9 @@ my %server = (
 	webmin_port         => $in{'webmin_port'} || 10000,
 	webmin_ssl          => $in{'webmin_ssl'} || 0,
 	webmin_user         => $in{'webmin_user'} || 'root',
-	ssh_host            => $in{'ssh_host'} || '',
-	ssh_user            => $in{'ssh_user'} || '',
-	ssh_key             => $in{'ssh_key'} || '',
+	ssh_host            => $in{'ssh_host'} || $in{'host'},
+	ssh_user            => $in{'ssh_user'} || 'root',
+	ssh_key             => $in{'ssh_key'},
 	spam_gateway        => $in{'spam_gateway'},
 	spam_gateway_host   => $in{'spam_gateway_host'} || 'mg',
 	outgoing_relay      => $in{'outgoing_relay'},
@@ -64,24 +57,13 @@ my %server = (
 	default             => $in{'default'} || 0,
 );
 
-# Validate mail routing fields
-foreach my $key (qw(spam_gateway spam_gateway_host outgoing_relay outgoing_relay_port)) {
-	if ($server{$key} && $server{$key} =~ /\S/) {
-		my $err = &validate_mail_override($key, $server{$key});
-		&error($err) if ($err);
-		}
-	}
-
-# Password: keep existing if not provided; require on new servers
+# Password: keep existing if not provided
 if ($in{'webmin_pass'}) {
 	$server{'webmin_pass'} = $in{'webmin_pass'};
 	}
 elsif (!$is_new) {
 	my $existing = &get_remote_mail_server($id);
 	$server{'webmin_pass'} = $existing->{'webmin_pass'} if ($existing);
-	}
-if (!$server{'webmin_pass'}) {
-	&error($text{'save_ewebmin_pass'});
 	}
 
 # If marking as default, unmark all others
@@ -97,5 +79,16 @@ if ($server{'default'}) {
 	}
 
 &save_remote_mail_server($id, \%server);
+
+# Deploy certbot SNI sync hook to the remote mail server.
+# This ensures that when certbot on the mail server renews any certificate,
+# the Postfix SNI map is rebuilt with postmap -F (base64-encoding the cert
+# contents, which is required by tls_server_sni_maps).
+my $hook_err = &deploy_remote_certbot_hook($id);
+if ($hook_err) {
+	# Non-fatal: log but don't block the save
+	&webmin_log("hook_deploy_failed", "server", $id, { 'error' => $hook_err });
+	}
+
 &webmin_log("save", "server", $id);
 &redirect("edit.cgi");

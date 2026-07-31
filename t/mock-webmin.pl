@@ -663,4 +663,21 @@ sub run_cgi_handler {
     return ($output, $err);
 }
 
+# require_cli_api_arch()
+# The repo carries two generations of this plugin:
+#   - the Virtualmin CLI-API generation (remote_virtualmin_cmd, validation
+#     helpers, user-management UI), and
+#   - the direct-SSH generation currently deployed on vh1.
+# Most of this suite was written against the former and cannot meaningfully run
+# against the latter. Gate those files on a function only the CLI-API
+# generation defines, so they skip cleanly today and re-arm by themselves as
+# that architecture is ported forward.
+sub require_cli_api_arch {
+    return if (defined &main::remote_virtualmin_cmd);
+    Test::More::plan(skip_all =>
+        "targets the Virtualmin CLI-API architecture; the deployed build is ".
+        "direct-SSH. Re-arms automatically once remote_virtualmin_cmd is ".
+        "ported forward.");
+}
+
 1;

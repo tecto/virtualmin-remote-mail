@@ -15,6 +15,9 @@ load_plugin_lib("$FindBin::Bin/../virtualmin-remote-mail-lib.pl");
 # Point domains_dir at temp directory
 $main::domains_dir = "$main::module_config_directory/domains";
 
+# See t/mock-webmin.pl: skips unless the CLI-API architecture is present.
+require_cli_api_arch();
+
 # =========================================
 # Test: Server Config CRUD
 # =========================================

@@ -1,5 +1,5 @@
 default_server=Default remote mail server,3,None
-ssl_sync_method=SSL certificate sync method,1,rpc-Webmin RPC
+ssl_sync_method=SSL certificate sync method,1,ssh-SSH/SCP
 dkim_selector=Default DKIM selector,0
 maildir_format=Maildir directory name,0
 disk_usage_cache=Disk usage cache TTL (seconds),0
