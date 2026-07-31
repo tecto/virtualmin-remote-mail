@@ -28,7 +28,8 @@
 #   own renewed cert never got copied into /home/vh2/ssl/, Postfix kept serving
 #   the expiring leaf-only cert until users started reporting SSL errors.
 #
-# This hook resolves home in three tiered ways:
+# This hook first normalises a wildcard lineage name ("*.example.com" →
+# "example.com"), then resolves home in three tiered ways:
 #   (a) `virtualmin list-domains --domain $CERT_NAME --simple-multiline`
 #       — authoritative if a Virtualmin domain owns the cert.
 #   (b) /home/$CERT_NAME if it exists as a directory (legacy fallback).
@@ -36,8 +37,16 @@
 #       Virtualmin user home is just the short name (the vh2 case).
 #
 # If none resolve, the hook logs and exits 0 (no error — other hooks may handle
-# this lineage). The hook is intended to be idempotent: running it twice
-# against the same lineage produces identical files.
+# this lineage). It distinguishes two cases when logging, because they need
+# very different responses:
+#   - Virtualmin does not know this cert at all  → genuinely not ours, skip.
+#   - Virtualmin DOES own the domain but no home/ssl dir was found → the cert
+#     should have been delivered and was not. Logged at err priority so it
+#     surfaces in monitoring instead of vanishing into a silent exit 0, which
+#     is how two domains served expired mail certs for three months.
+#
+# The hook is intended to be idempotent: running it twice against the same
+# lineage produces identical files.
 
 set -euo pipefail
 
@@ -47,18 +56,37 @@ LINEAGE="${RENEWED_LINEAGE:-}"
 [ -z "$LINEAGE" ] && exit 0
 [ ! -d "$LINEAGE" ] && exit 0
 
-CERT_NAME=$(basename "$LINEAGE")
+LINEAGE_NAME=$(basename "$LINEAGE")
+
+# Wildcard lineages are stored on disk with a literal asterisk:
+# /etc/letsencrypt/live/*.example.com. Nothing downstream carries that prefix
+# — not the Virtualmin domain name, not the home directory, not the SNI map
+# entries or the <home>/ssl/<name>.{crt,key,ca} filenames — so normalise it
+# away before resolving anything.
+#
+# Leaving it in place makes ALL THREE resolution tiers below fail: (a) queries
+# Virtualmin for a domain named "*.example.com" which does not exist, (b) tests
+# the quoted literal path /home/*.example.com/ssl, and (c) reduces to "*" and
+# tests /home/*/ssl. The hook then exit-0s and the cert is never delivered.
+# That is the smokeandleaf.com incident; see t/regression/10-wildcard-lineage.t.
+CERT_NAME="${LINEAGE_NAME#\*.}"
 
 # --- Home directory resolution (tiered) ----------------------------------
 
 HOME_DIR=""
 
 # (a) Ask Virtualmin authoritatively.
+# VM_OWNS_DOMAIN records whether Virtualmin knows this domain at all, which is
+# what separates "not our cert" from "our cert, delivery failed" further down.
+VM_OWNS_DOMAIN=0
 if command -v virtualmin >/dev/null 2>&1; then
     home_from_vm=$(virtualmin list-domains --domain "$CERT_NAME" --simple-multiline 2>/dev/null \
                    | awk -F': ' '/^Home directory:/ {print $2; exit}')
-    if [ -n "$home_from_vm" ] && [ -d "$home_from_vm/ssl" ]; then
-        HOME_DIR="$home_from_vm"
+    if [ -n "$home_from_vm" ]; then
+        VM_OWNS_DOMAIN=1
+        if [ -d "$home_from_vm/ssl" ]; then
+            HOME_DIR="$home_from_vm"
+        fi
     fi
 fi
 
@@ -76,8 +104,15 @@ if [ -z "$HOME_DIR" ]; then
 fi
 
 if [ -z "$HOME_DIR" ]; then
-    logger -t virtualmin-remote-mail-sni-sync \
-        "no home directory resolved for cert '$CERT_NAME' — skipping"
+    if [ "$VM_OWNS_DOMAIN" = "1" ]; then
+        # Virtualmin owns this domain, so the cert was meant to land somewhere
+        # and did not. Do not let this look like a routine skip.
+        logger -p daemon.err -t virtualmin-remote-mail-sni-sync \
+            "cert '$CERT_NAME' (lineage '$LINEAGE_NAME') belongs to a Virtualmin domain but no <home>/ssl directory was found — certificate NOT delivered"
+    else
+        logger -t virtualmin-remote-mail-sni-sync \
+            "no Virtualmin domain owns cert '$CERT_NAME' (lineage '$LINEAGE_NAME') — skipping"
+    fi
     exit 0
 fi
 
@@ -136,4 +171,4 @@ systemctl restart postfix 2>/dev/null || true
 systemctl restart dovecot 2>/dev/null || true
 
 logger -t virtualmin-remote-mail-sni-sync \
-    "synced $CERT_NAME to $HOME_DIR"
+    "synced $CERT_NAME (lineage $LINEAGE_NAME) to $HOME_DIR"
