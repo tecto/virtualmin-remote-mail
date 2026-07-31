@@ -212,6 +212,8 @@ if ($ok) {
 	else {
 		$state{'ssl_synced'} = 1;
 		$d->{'remote_mail_ssl_synced'} = time();
+		$d->{'remote_mail_ssl_fp'} =
+			&get_ssl_cert_fingerprint($d->{'ssl_cert'});
 		&$virtual_server::second_print(
 			$virtual_server::text{'setup_done'});
 		}
@@ -273,6 +275,7 @@ else {
 &delete_domain_state($d->{'dom'});
 delete $d->{'remote_mail_server'};
 delete $d->{'remote_mail_ssl_synced'};
+delete $d->{'remote_mail_ssl_fp'};
 delete $d->{'remote_mail_dkim_enabled'};
 delete $d->{'remote_mail_spam_gateway'};
 delete $d->{'remote_mail_spam_gateway_host'};
@@ -304,8 +307,23 @@ foreach my $key (qw(spam_gateway spam_gateway_host outgoing_relay outgoing_relay
 		}
 	}
 
-# Check if SSL certificate changed (triggered by install-cert,
-# generate-letsencrypt-cert, etc. which call feature_modify for all plugins)
+# Check if the SSL certificate changed.
+#
+# Two things to know about this block:
+#
+#  1. Virtualmin's cert paths are stable across Let's Encrypt renewals -- only
+#     the file *contents* change -- so comparing $d->{'ssl_cert'} against
+#     $oldd->{'ssl_cert'} can never be true for a renewal. Compare a
+#     fingerprint of the cert on disk against the one recorded at the last
+#     successful sync as well.
+#
+#  2. Contrary to what this comment used to claim, install-cert.pl and
+#     generate-letsencrypt-cert.pl do NOT call feature_modify -- neither
+#     contains a single plugin_call, and no caller of
+#     plugin_call(..., "feature_modify") anywhere in virtual-server sits in the
+#     SSL path. Renewals are delivered by the certbot deploy hook
+#     (deploy-hooks/sni-sync.sh). This block is a backstop for when
+#     feature_modify is invoked by other domain operations.
 my $ssl_changed = 0;
 if ($d->{'ssl_cert'} && $oldd->{'ssl_cert'}) {
 	$ssl_changed = ($d->{'ssl_cert'} ne $oldd->{'ssl_cert'} ||
@@ -313,6 +331,14 @@ if ($d->{'ssl_cert'} && $oldd->{'ssl_cert'}) {
 	}
 elsif ($d->{'ssl_cert'} && !$oldd->{'ssl_cert'}) {
 	$ssl_changed = 1;
+	}
+my $ssl_fp;
+if ($d->{'ssl_cert'}) {
+	$ssl_fp = &get_ssl_cert_fingerprint($d->{'ssl_cert'});
+	if (!$ssl_changed && $ssl_fp &&
+	    $ssl_fp ne ($d->{'remote_mail_ssl_fp'} || '')) {
+		$ssl_changed = 1;
+		}
 	}
 
 if ($renamed || $overrides_changed) {
@@ -370,6 +396,7 @@ if ($ssl_changed) {
 		}
 	else {
 		$d->{'remote_mail_ssl_synced'} = time();
+		$d->{'remote_mail_ssl_fp'} = $ssl_fp if ($ssl_fp);
 		&$virtual_server::second_print(
 			$virtual_server::text{'setup_done'});
 		}
@@ -976,6 +1003,21 @@ return $@ ? "$@" : undef;
 }
 
 # ---- SSL Certificate Sync ----
+
+# get_ssl_cert_fingerprint($file)
+# Returns the SHA-256 fingerprint of an X.509 certificate, or undef if the file
+# is missing or unreadable. Used to detect content-only certificate changes --
+# Let's Encrypt renewals reuse the same path, so a path comparison alone can
+# never see them.
+sub get_ssl_cert_fingerprint
+{
+my ($file) = @_;
+return undef if (!$file || ! -r $file);
+my $out = &backquote_command("openssl x509 -in ".quotemeta($file).
+			     " -noout -fingerprint -sha256 2>/dev/null");
+return undef if ($?);
+return $out =~ /=\s*([0-9A-Fa-f:]+)/ ? $1 : undef;
+}
 
 # sync_remote_mail_ssl(&domain, $server_id)
 # Syncs SSL certificates from vh1 to the remote mail server using Virtualmin's
