@@ -13,7 +13,9 @@ set -e
 
 REPO="https://github.com/trinsiklabs/virtualmin-remote-mail.git"
 TMPDIR=$(mktemp -d)
-trap "rm -rf $TMPDIR" EXIT
+# Single quotes so $TMPDIR is expanded when the trap fires, not when it is set
+# (SC2064). Expanding early would bake in an unquoted path.
+trap 'rm -rf "$TMPDIR"' EXIT
 
 MODE=${1:-plugin}
 

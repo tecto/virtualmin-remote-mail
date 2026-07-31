@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Perl test suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show Perl version
+        run: perl -V:version
+
+      # Every module used by the suite (Test::More, File::Temp, File::Path,
+      # FindBin, Cwd) ships with core Perl, so there is nothing to install.
+      - name: Syntax-check Perl sources
+        run: |
+          status=0
+          for f in *.pl *.cgi; do
+            [ -e "$f" ] || continue
+            # Module sources expect to be loaded inside Webmin, so a bare
+            # `perl -c` cannot resolve their requires. Check for parse errors
+            # only, and treat unresolved requires as expected.
+            out=$(perl -c "$f" 2>&1) || true
+            if echo "$out" | grep -qE 'syntax error|Missing right curly|Unmatched'; then
+              echo "::error file=$f::$out"
+              status=1
+            fi
+          done
+          exit $status
+
+      - name: Run test suite
+        run: prove -r t/
+
+  shellcheck:
+    name: Shellcheck deploy hooks and installer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Check shell scripts
+        run: shellcheck --severity=warning deploy-hooks/*.sh install.sh
