@@ -1155,6 +1155,15 @@ sub create_remote_mail_user
 {
 my ($d, $server_id, $user, $password, $opts) = @_;
 my $dom = $d->{'dom'};
+
+# $user and $dom are interpolated into shell commands run as root on the mail
+# server below. Validate both here so that interpolation cannot inject; do not
+# assume the caller checked.
+my $verr = &validate_mail_username($user);
+return $verr if ($verr);
+my $derr = &validate_domain_name($dom);
+return $derr if ($derr);
+
 my $email = "${user}\@${dom}";
 my $server = &get_remote_mail_server($server_id);
 my $maildir = $server->{'maildir_format'} || '.maildir';
@@ -1211,6 +1220,13 @@ sub delete_remote_mail_user
 {
 my ($d, $server_id, $user) = @_;
 my $dom = $d->{'dom'};
+
+# Same reasoning as create_remote_mail_user: these values reach a root shell.
+my $verr = &validate_mail_username($user);
+return $verr if ($verr);
+my $derr = &validate_domain_name($dom);
+return $derr if ($derr);
+
 my $email = "${user}\@${dom}";
 
 eval {

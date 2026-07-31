@@ -159,6 +159,80 @@ return undef if (!$serv);
 return &remote_foreign_call($serv, $module, $func, @args);
 }
 
+# ---- Input validation ----
+#
+# Several remote operations build shell commands by interpolating a domain or
+# mailbox name and running them as root over SSH. Validating those values at
+# the boundary is what makes that interpolation safe, so validate before use --
+# do not rely on callers having done it.
+
+# _shell_quote($str)
+# Shell-safe single-quoting for command arguments.
+sub _shell_quote
+{
+my ($str) = @_;
+$str =~ s/'/'\\''/g;
+return "'$str'";
+}
+
+# validate_domain_name($domain)
+# Validates a domain name for use in file paths and config.
+# Returns undef on success, or an error message string on failure.
+sub validate_domain_name
+{
+my ($domain) = @_;
+return "Domain name is required" if (!$domain || $domain !~ /\S/);
+return "Invalid domain name" if ($domain !~ /^[a-zA-Z0-9]([a-zA-Z0-9.\-]*[a-zA-Z0-9])?$/);
+return "Invalid domain name" if ($domain =~ /\.\./);
+return undef;
+}
+
+# validate_mail_username($username)
+# Validates a mail username (the local part before @domain).
+#
+# Two layers, in this order:
+#
+#  1. A strict allowlist. Virtualmin's valid_mailbox_name() is NOT sufficient
+#     on its own for a value that reaches a shell. It defers to
+#     valid_alias_name(), whose check is a blacklist:
+#         /^[^ \t:\&\(\)\|\;\<\>\*\?\!\/\\]+$/
+#     That rejects ; & | ( ) etc., but permits backtick, newline, $, { } and
+#     quotes -- so "bob`id`" and "bob\nid" both pass it and would execute on
+#     the mail server. It is a mailbox-name check, not a shell-safety check,
+#     and using it as one is a category error.
+#
+#  2. Virtualmin's own checks, for the semantics the allowlist knows nothing
+#     about: reserved names, numeric prefixes, and system username
+#     restrictions via useradmin::check_username_restrictions.
+#
+# Returns undef on success, or an error message string on failure.
+sub validate_mail_username
+{
+my ($username) = @_;
+if (!defined($username) || $username eq '') {
+	return "Username is required";
+	}
+if ($username !~ /^[A-Za-z0-9._%+\-]+$/) {
+	return "Invalid username: only letters, digits and . _ % + - are allowed";
+	}
+if ($username =~ /\.\./) {
+	return "Invalid username";
+	}
+return &virtual_server::valid_mailbox_name($username);
+}
+
+# validate_email_address($email)
+# Validates an email address format.
+# Returns undef on success, or an error message string on failure.
+sub validate_email_address
+{
+my ($email) = @_;
+return "Email address is required" if (!$email || $email !~ /\S/);
+return "Invalid email address: $email"
+	if ($email !~ /^[a-zA-Z0-9._%+\-]+\@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$/);
+return undef;
+}
+
 # remote_mail_ssh($server_id, $command)
 # Executes a command on the remote server via SSH.
 # Returns ($output, $exit_code).
