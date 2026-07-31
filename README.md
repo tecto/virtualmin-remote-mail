@@ -66,12 +66,17 @@ After installation, go to the module page and add a remote mail server with:
 ```bash
 cd /usr/share/webmin/virtualmin-remote-mail
 
-# Run unit tests (no server access needed)
-prove t/
+# Run unit + regression tests (no server access needed)
+prove -r t/
 
 # Run integration tests (requires real servers)
 REMOTE_MAIL_INTEGRATION=1 prove t/06-integration.t
 ```
+
+Regression tests for previously-shipped production bugs live in `t/regression/`.
+Each file leads with a header citing the incident, root cause, and fix
+artifact, and is verified to fail against the buggy version and pass against
+the fix (red-green verification protocol).
 
 ## File Structure
 
@@ -91,8 +96,41 @@ cgi_args.pl                    # URL argument defaults
 log_parser.pl                  # Webmin action log parser
 lang/en                        # Language strings
 help/feat.html                 # Feature help page
-t/                             # Test suite
+t/                             # Test suite (incl. t/regression/ for prior-bug guards)
+deploy-hooks/                  # Certbot deploy hook shipped for the mail server
 ```
+
+## Certbot Deploy Hook (mail server)
+
+When the mail server (vh2) terminates its own Let's Encrypt cert — for its
+hostname or for any domain whose certs are renewed locally rather than synced
+from vh1 — install the deploy hook at `deploy-hooks/sni-sync.sh`. It runs after
+each successful renewal and:
+
+1. Resolves the renewed cert's home directory via three tiered strategies:
+   `virtualmin list-domains` (authoritative), then `/home/<cert-name>` (when
+   the cert name matches the Virtualmin user name), then `/home/<short>` where
+   `<short>` is the FQDN's first dot-segment (the hostname-cert case — e.g.
+   cert `vh2.trinsik.io` → home `/home/vh2`).
+2. Copies cert/key/chain into `<home>/ssl/<cert-name>.{crt,key,ca}`.
+3. Rebuilds `<home>/ssl.combined` as `key + leaf + chain` (Dovecot's
+   `local_name { ssl_cert = </home/...> }` blocks read this file directly, so
+   the chain must be inside it — Apple Mail rejects leaf-only chains).
+4. Refreshes the Postfix SNI map with `postmap -F` (base64-encoded contents,
+   NOT plain `postmap`).
+5. Restarts (not reloads) Postfix and Dovecot.
+
+Install on the mail server:
+
+```bash
+curl -sL https://raw.githubusercontent.com/trinsiklabs/virtualmin-remote-mail/main/install.sh \
+    | bash -s -- --install-deploy-hook
+```
+
+The regression test `t/regression/20-deploy-hook-home-dir.t` guards the home-
+directory resolution logic; an earlier hook version hard-coded
+`HOME_DIR=/home/$CERT_NAME` and silently no-op'd when the cert name didn't
+match a home directory (incident: 2026-05-13, vh2's own cert).
 
 ## Feature Hooks
 

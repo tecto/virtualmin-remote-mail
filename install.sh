@@ -1,14 +1,41 @@
 #!/bin/bash
-# install.sh — Install virtualmin-remote-mail from GitHub
-# Usage: curl -sL https://raw.githubusercontent.com/trinsiklabs/virtualmin-remote-mail/main/install.sh | bash
+# install.sh — Install virtualmin-remote-mail from GitHub.
+#
+# Two modes:
+#   1. (default — run on vh1) install the Webmin plugin into Virtualmin.
+#        curl -sL https://raw.githubusercontent.com/trinsiklabs/virtualmin-remote-mail/main/install.sh | bash
+#   2. --install-deploy-hook  (run on the mail server vh2) install the certbot
+#      deploy hook only. Use this when vh2 also terminates Let's Encrypt for
+#      its own hostname or any domain whose certs are renewed locally.
+#        curl -sL https://raw.githubusercontent.com/trinsiklabs/virtualmin-remote-mail/main/install.sh \
+#            | bash -s -- --install-deploy-hook
 set -e
 
 REPO="https://github.com/trinsiklabs/virtualmin-remote-mail.git"
 TMPDIR=$(mktemp -d)
 trap "rm -rf $TMPDIR" EXIT
 
+MODE=${1:-plugin}
+
 echo "Downloading virtualmin-remote-mail..."
 git clone --depth 1 "$REPO" "$TMPDIR/virtualmin-remote-mail" 2>/dev/null
+
+if [ "$MODE" = "--install-deploy-hook" ]; then
+    # vh2-mode: install the certbot deploy hook only.
+    HOOK_SRC="$TMPDIR/virtualmin-remote-mail/deploy-hooks/sni-sync.sh"
+    HOOK_DST="/etc/letsencrypt/renewal-hooks/deploy/virtualmin-remote-mail-sni-sync.sh"
+    if [ ! -f "$HOOK_SRC" ]; then
+        echo "error: deploy hook not found in repo at deploy-hooks/sni-sync.sh" >&2
+        exit 1
+    fi
+    mkdir -p "$(dirname "$HOOK_DST")"
+    install -m 0755 "$HOOK_SRC" "$HOOK_DST"
+    echo "Installed deploy hook: $HOOK_DST"
+    echo "It will fire after the next certbot renewal."
+    echo "Test it manually with:"
+    echo "  sudo env RENEWED_LINEAGE=/etc/letsencrypt/live/<cert-name> bash -x $HOOK_DST"
+    exit 0
+fi
 
 echo "Packaging module..."
 tar czf "$TMPDIR/virtualmin-remote-mail.wbm.gz" \
@@ -34,3 +61,6 @@ echo "  1. Configure a remote mail server at:"
 echo "     Webmin > Servers > Remote Mail Server"
 echo "  2. Enable for a domain:"
 echo "     virtualmin enable-feature --domain example.com --virtualmin-remote-mail"
+echo "  3. On the mail server (vh2), install the certbot deploy hook:"
+echo "     curl -sL https://raw.githubusercontent.com/trinsiklabs/virtualmin-remote-mail/main/install.sh \\"
+echo "         | bash -s -- --install-deploy-hook"
