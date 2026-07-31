@@ -17,7 +17,16 @@ TMPDIR=$(mktemp -d)
 # (SC2064). Expanding early would bake in an unquoted path.
 trap 'rm -rf "$TMPDIR"' EXIT
 
-MODE=${1:-plugin}
+MODE="plugin"
+FORCE=0
+for arg in "$@"; do
+    case "$arg" in
+        --install-deploy-hook) MODE="--install-deploy-hook" ;;
+        --force)               FORCE=1 ;;
+        "")                    ;;
+        *) echo "error: unknown option '$arg'" >&2; exit 1 ;;
+    esac
+done
 
 echo "Downloading virtualmin-remote-mail..."
 git clone --depth 1 "$REPO" "$TMPDIR/virtualmin-remote-mail" 2>/dev/null
@@ -39,10 +48,62 @@ if [ "$MODE" = "--install-deploy-hook" ]; then
     exit 0
 fi
 
+# --- Guard against silently overwriting a divergent install ------------------
+#
+# This installer clones main and copies over whatever is already on the server.
+# If the server is running code that was never committed, an ordinary
+# `curl | bash` destroys it with no warning. That is not hypothetical: in
+# 2026-07 vh1 was found running a build roughly three months and ~2300 lines
+# ahead of main, which this script would have silently reverted.
+#
+# So: always back up, and refuse to overwrite a divergent install unless the
+# caller explicitly passes --force.
+
+INSTALLED="/usr/share/webmin/virtualmin-remote-mail"
+# Paths that live in the repo but are never installed, so they must not count
+# as divergence.
+DIFF_EXCLUDES=(-x '.git' -x '.github' -x 't' -x 'deploy-hooks' -x 'patches'
+               -x '.gitignore' -x 'install.sh')
+
+if [ -d "$INSTALLED" ]; then
+    BACKUP="/root/virtualmin-remote-mail.backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+    if tar czf "$BACKUP" -C "$(dirname "$INSTALLED")" \
+            "$(basename "$INSTALLED")" 2>/dev/null; then
+        echo "Backed up current install to $BACKUP"
+    else
+        echo "warning: could not back up $INSTALLED" >&2
+    fi
+
+    if ! diff -rq "${DIFF_EXCLUDES[@]}" \
+            "$INSTALLED" "$TMPDIR/virtualmin-remote-mail" >/dev/null 2>&1; then
+        echo ""
+        echo "The installed module differs from $REPO (main):"
+        diff -rq "${DIFF_EXCLUDES[@]}" \
+            "$INSTALLED" "$TMPDIR/virtualmin-remote-mail" 2>&1 | sed 's/^/  /'
+        echo ""
+        if [ "$FORCE" != "1" ]; then
+            cat >&2 <<EOF
+error: refusing to overwrite a divergent install.
+
+The running code is not the same as main. If the server is ahead, installing
+would discard work that was never committed. Reconcile first -- commit the
+server's version, or confirm main is genuinely newer -- then re-run with:
+
+    ... | bash -s -- --force
+
+A backup of the current install is at:
+    $BACKUP
+EOF
+            exit 1
+        fi
+        echo "--force given: proceeding despite divergence."
+    fi
+fi
+
 echo "Packaging module..."
 tar czf "$TMPDIR/virtualmin-remote-mail.wbm.gz" \
-    --exclude='.git' --exclude='t' --exclude='.gitignore' \
-    --exclude='install.sh' \
+    --exclude='.git' --exclude='.github' --exclude='t' --exclude='.gitignore' \
+    --exclude='deploy-hooks' --exclude='patches' --exclude='install.sh' \
     -C "$TMPDIR" virtualmin-remote-mail/
 
 echo "Installing module..."

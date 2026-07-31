@@ -32,6 +32,17 @@ curl -sL https://raw.githubusercontent.com/trinsiklabs/virtualmin-remote-mail/ma
 
 This downloads the module from GitHub, packages it, installs it into Webmin, and registers it as a Virtualmin plugin automatically.
 
+Before overwriting anything it backs the current install up to
+`/root/virtualmin-remote-mail.backup-<timestamp>.tar.gz`, and if the installed
+module differs from `main` it lists the differing files and **refuses to
+proceed**. That protects against the case where the server is running code
+that was never committed — installing would silently discard it. Reconcile
+first (commit the server's version, or confirm `main` really is newer), then:
+
+```bash
+curl -sL https://raw.githubusercontent.com/trinsiklabs/virtualmin-remote-mail/main/install.sh | bash -s -- --force
+```
+
 ## Manual Installation
 
 ```bash
